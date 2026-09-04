@@ -6,9 +6,13 @@ import csv
 import json
 import os
 from pathlib import Path
+from threading import Lock
 from typing import Any
 
 from .core import games_rows, markdown_report
+
+
+_CONTROL_LOCK = Lock()
 
 
 class RunStore:
@@ -22,6 +26,8 @@ class RunStore:
         self.events_path = self.logs_dir / "events.jsonl"
         # 这是大屏的临时画面，不是可恢复的赛事状态。
         self.live_path = run_dir / "live.json"
+        # 当前运行器与本机大屏之间的一次性“开始下一局”信号。
+        self.control_path = run_dir / "control.json"
 
     def create(self) -> None:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
@@ -78,3 +84,37 @@ class RunStore:
         """中断后不留下可被误认为正式赛果的半盘棋。"""
         if self.live_path.exists():
             self.live_path.unlink()
+
+    def read_control(self) -> dict[str, Any] | None:
+        try:
+            return json.loads(self.control_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def arm_next_game(self, game_key: str) -> None:
+        """只允许看板确认当前刚刚结束的一局。"""
+        with _CONTROL_LOCK:
+            self.create()
+            self._atomic_text(self.control_path, json.dumps({"game_key": game_key, "status": "waiting"}, ensure_ascii=False) + "\n")
+
+    def approve_next_game(self) -> bool:
+        """供本机看板调用；重复点击只会成功一次。"""
+        with _CONTROL_LOCK:
+            control = self.read_control()
+            if not control or control.get("status") != "waiting":
+                return False
+            control["status"] = "approved"
+            self._atomic_text(self.control_path, json.dumps(control, ensure_ascii=False) + "\n")
+            return True
+
+    def consume_next_game(self, game_key: str) -> bool:
+        with _CONTROL_LOCK:
+            control = self.read_control()
+            if not control or control.get("game_key") != game_key or control.get("status") != "approved":
+                return False
+            self.control_path.unlink(missing_ok=True)
+            return True
+
+    def clear_control(self) -> None:
+        with _CONTROL_LOCK:
+            self.control_path.unlink(missing_ok=True)

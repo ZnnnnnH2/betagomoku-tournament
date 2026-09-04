@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 import sys
+import time
 from typing import Any
 
 from .core import ServiceUnavailable, all_groups_done, blank_board, finished_fixture, new_tournament, next_fixture, parse_roster, play_game, utc_now
@@ -38,11 +39,12 @@ def _publish_live(
     board: list[list[int]] | None = None,
     last_move: list[int] | None = None,
     message: str = "正在对局",
+    status: str = "playing",
 ) -> None:
     store.save_live(
         {
             "updated_at": utc_now(),
-            "status": "playing",
+            "status": status,
             "tables": [
                 {
                     "table": 1,
@@ -63,7 +65,28 @@ def _publish_live(
     )
 
 
-def run_one_fixture(state: dict[str, Any], store: RunStore, client: PlatformClient) -> bool:
+def _wait_for_next_game(store: RunStore, fixture: dict[str, Any], game_number: int) -> None:
+    game_key = f"{fixture['id']}:{game_number}"
+    store.arm_next_game(game_key)
+    print("本局已保存；请在大屏看板点击“开始下一局”。")
+    while not store.consume_next_game(game_key):
+        time.sleep(0.2)
+
+
+def _wait_for_restored_control(store: RunStore) -> None:
+    control = store.read_control()
+    if not control:
+        return
+    game_key = control.get("game_key")
+    if not isinstance(game_key, str):
+        store.clear_control()
+        return
+    print("检测到上一局已结束，继续等待大屏看板的“开始下一局”按钮。")
+    while not store.consume_next_game(game_key):
+        time.sleep(0.2)
+
+
+def run_one_fixture(state: dict[str, Any], store: RunStore, client: PlatformClient, manual_next: bool) -> bool:
     fixture = next_fixture(state)
     if fixture is None:
         return False
@@ -77,8 +100,12 @@ def run_one_fixture(state: dict[str, Any], store: RunStore, client: PlatformClie
         store.log({"at": utc_now(), "type": "game_started", "fixture": fixture["id"], "game": index + 1, "black": black, "white": white})
         print(f"{fixture['round']}，第 {index + 1}/2 局：{black} 黑 vs {white} 白")
         _publish_live(store, fixture, index + 1, black, white)
+        final_board = blank_board()
+        final_last_move: list[int] | None = None
 
         def observe(moves: int, board: list[list[int]], color: int, row: int, col: int) -> None:
+            nonlocal final_board, final_last_move
+            final_board, final_last_move = board, [row, col]
             _publish_live(store, fixture, index + 1, black, white, moves, board, [row, col])
             print(f"  {moves} 手", end="\r", flush=True)
 
@@ -96,9 +123,19 @@ def run_one_fixture(state: dict[str, Any], store: RunStore, client: PlatformClie
         store.save(state)
         store.save_game_record(fixture, index + 1, game)
         store.log({"at": utc_now(), "type": "game_finished", "fixture": fixture["id"], "game": game})
+        if game["winner"] == "draw":
+            outcome = f"本局平局；规则计 {game['white']} 白胜；{game['moves']} 手"
+        else:
+            winner = game["black"] if game["winner"] == "black" else game["white"]
+            outcome = f"本局结束：{winner} 获胜；{game['moves']} 手"
+        _publish_live(
+            store, fixture, index + 1, black, white, game["moves"], final_board, final_last_move,
+            outcome, "waiting_for_next" if manual_next else "completed",
+        )
+        if manual_next:
+            _wait_for_next_game(store, fixture, index + 1)
     finished_fixture(state, fixture)
     store.save(state)
-    store.clear_live()
     return True
 
 
@@ -136,7 +173,9 @@ def command_run(args: argparse.Namespace) -> int:
     limit = {"next": 1, "group": 30, "all": 37}[args.mode]
     completed = 0
     browser = state.get("browser", "default")
+    manual_next = not args.auto_next
     try:
+        _wait_for_restored_control(store)
         with PlatformClient(profile_for(run_dir, browser), browser=browser) as client:
             client.wait_for_login()
             validate_roster(client, state)
@@ -146,11 +185,21 @@ def command_run(args: argparse.Namespace) -> int:
                     break
                 if args.mode == "group" and fixture["phase"] != "group":
                     break
-                run_one_fixture(state, store, client)
+                run_one_fixture(state, store, client, manual_next)
                 completed += 1
     finally:
-        # 赛程和已结束对局已经逐局保存；当前棋盘只属于临时展示。
-        store.clear_live()
+        # 已结束局留在看板上；只有未完成局的临时棋盘需要清除。
+        live = None
+        try:
+            import json
+            live = json.loads(store.live_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        if live and live.get("status") == "playing":
+            store.clear_live()
+            store.clear_control()
+        elif not live or live.get("status") != "waiting_for_next":
+            store.clear_control()
     print(f"本次完成 {completed} 场双局。文件已写入：{run_dir.resolve()}")
     return 0
 
@@ -200,6 +249,7 @@ def build_parser() -> argparse.ArgumentParser:
     for name, help_text in (("next", "执行下一场双局"), ("group", "执行剩余小组赛"), ("all", "执行完整届赛事")):
         run = sub.add_parser(name, help=help_text)
         run.add_argument("--run-dir", required=True)
+        run.add_argument("--auto-next", action="store_true", help="不等待大屏按钮，连续执行下一局")
         run.set_defaults(handler=command_run, mode=name)
     status = sub.add_parser("status", help="读取本地状态，不打开浏览器")
     status.add_argument("--run-dir", required=True)

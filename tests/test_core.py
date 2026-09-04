@@ -98,6 +98,18 @@ class TournamentCoreTests(unittest.TestCase):
             self.assertEqual(payload["live"]["tables"][0]["moves"], 1)
             self.assertEqual(store.load()["group_fixtures"][0]["status"], "pending")
 
+    def test_dashboard_next_game_control_is_single_use(self) -> None:
+        state = new_tournament(self.roster, "seed")
+        with tempfile.TemporaryDirectory() as temporary:
+            store = RunStore(Path(temporary))
+            store.save(state)
+            store.arm_next_game("group-01:1")
+            self.assertEqual(dashboard_payload(Path(temporary))["control"]["status"], "waiting")
+            self.assertTrue(store.approve_next_game())
+            self.assertFalse(store.approve_next_game())
+            self.assertTrue(store.consume_next_game("group-01:1"))
+            self.assertFalse(store.consume_next_game("group-01:1"))
+
     def test_knockout_decision_exposes_the_same_tiebreak_used_for_advancement(self) -> None:
         state = new_tournament(self.roster, "seed")
         fixture = {
