@@ -25,10 +25,15 @@
   let capture = null;
   let fetchHooked = false;
   let drawHooked = false;
+  let autoNextTimer = null;
 
   function save(state) { localStorage.setItem(KEY, JSON.stringify(state)); }
   function load() {
-    try { const raw = localStorage.getItem(KEY); return raw ? JSON.parse(raw) : null; }
+    try {
+      const state = JSON.parse(localStorage.getItem(KEY) || 'null');
+      if (state) state.settings = Object.assign({ autoDownload: true, autoNext: false }, state.settings);
+      return state;
+    }
     catch (error) { console.error(error); return null; }
   }
   function tell(message, error) {
@@ -83,7 +88,7 @@
     });
     return {
       format: 'beta-gomoku-page-record-2.0', createdAt: new Date().toISOString(), seed, roster: people,
-      ties, groups, groupFixtures, knockout: null, events: [], waiting: null, settings: { autoDownload: true }
+      ties, groups, groupFixtures, knockout: null, events: [], waiting: null, settings: { autoDownload: true, autoNext: false }
     };
   }
 
@@ -298,6 +303,16 @@
     ])));
     return rows.map(row => row.map(value => '"' + String(value == null ? '' : value).replaceAll('"', '""') + '"').join(',')).join('\n');
   }
+  function scheduleAutoNext(state) {
+    clearTimeout(autoNextTimer);
+    tell('本局记录已保存；自动模式将在 3 秒后开始下一局。');
+    autoNextTimer = setTimeout(() => {
+      autoNextTimer = null;
+      const latest = load();
+      if (!latest || latest.createdAt !== state.createdAt || !latest.settings.autoNext || active) return;
+      runOne(latest);
+    }, 3000);
+  }
   async function runOne(state) {
     if (active) return;
     const fixture = nextFixture(state);
@@ -312,6 +327,7 @@
     active = true;
     render(state);
     tell(fixture.round + ' 第 ' + number + '/2 局：' + black + ' 黑 vs ' + white + ' 白；正在运行网页 Start。');
+    let autoNext = false;
     try {
       const game = await realGame(black, white);
       fixture.games.push(game);
@@ -322,7 +338,8 @@
           advance(state);
         }
       }
-      state.waiting = { fixture: fixture.id, game: number, at: game.finishedAt, message: fixture.round + ' 第 ' + number + ' 局已结束；点击“开始下一局”继续。' };
+      autoNext = Boolean(state.settings.autoNext);
+      state.waiting = { fixture: fixture.id, game: number, at: game.finishedAt, message: fixture.round + ' 第 ' + number + ' 局已结束；' + (autoNext ? '自动模式将在 3 秒后继续。' : '点击“开始下一局”继续。') };
       state.events.push({ type: 'game_finished', at: game.finishedAt, fixture: fixture.id, game: number, result: game });
       save(state);
       if (state.settings.autoDownload) download('betagomoku-' + fixture.id + '-game-' + number + '.json', 'application/json;charset=utf-8', JSON.stringify(record(state, fixture, game, number), null, 2));
@@ -336,6 +353,7 @@
     } finally {
       active = false;
       render(state);
+      if (autoNext) scheduleAutoNext(state);
     }
   }
 
@@ -373,8 +391,9 @@
     const groupGames = state.groupFixtures.reduce((sum, item) => sum + item.games.length, 0);
     const totalGames = fixtures(state).reduce((sum, item) => sum + item.games.length, 0);
     const waiting = state.waiting ? state.waiting.message : (active ? '网页正在执行当前局…' : '准备开始下一局。');
-    panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p class="bgta-waiting">' + esc(waiting) + '</p><p>小组赛 ' + groupGames + '/60 局；全赛事 ' + totalGames + '/74 局。</p><div class="bgta-actions"><button id="bgta-next" ' + (active ? 'disabled' : '') + '>开始下一局</button><button id="bgta-json">导出完整 JSON</button><button id="bgta-csv">导出 CSV</button><button id="bgta-bracket">生成八强签表</button><button id="bgta-reset">清除本机赛事</button></div><label class="bgta-check"><input id="bgta-auto" type="checkbox" ' + (state.settings.autoDownload ? 'checked' : '') + '> 每局结束自动下载完整 JSON 记录</label><p id="bgta-status"></p><div class="bgta-groups">' + state.groups.map(group => groupHtml(state, group)).join('') + '</div>' + knockoutHtml(state);
+    panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p class="bgta-waiting">' + esc(waiting) + '</p><p>小组赛 ' + groupGames + '/60 局；全赛事 ' + totalGames + '/74 局。</p><div class="bgta-actions"><button id="bgta-next" ' + (active ? 'disabled' : '') + '>开始下一局</button><button id="bgta-auto-next" ' + (active ? 'disabled' : '') + '>' + (state.settings.autoNext ? '自动开始：开（点击关闭）' : '自动开始：关（点击开启）') + '</button><button id="bgta-json">导出完整 JSON</button><button id="bgta-csv">导出 CSV</button><button id="bgta-bracket">生成八强签表</button><button id="bgta-reset">清除本机赛事</button></div><label class="bgta-check"><input id="bgta-auto" type="checkbox" ' + (state.settings.autoDownload ? 'checked' : '') + '> 每局结束自动下载完整 JSON 记录</label><p id="bgta-status"></p><div class="bgta-groups">' + state.groups.map(group => groupHtml(state, group)).join('') + '</div>' + knockoutHtml(state);
     $id('bgta-next').onclick = () => runOne(state);
+    $id('bgta-auto-next').onclick = () => { state.settings.autoNext = !state.settings.autoNext; save(state); render(state); tell(state.settings.autoNext ? '已开启自动开始：每局终局展示 3 秒后继续。' : '已关闭自动开始：下一局需手动点击。'); };
     $id('bgta-json').onclick = () => download('betagomoku-tournament.json', 'application/json;charset=utf-8', JSON.stringify(state, null, 2));
     $id('bgta-csv').onclick = () => download('betagomoku-games.csv', 'text/csv;charset=utf-8', '\uFEFF' + toCsv(state));
     $id('bgta-auto').onchange = event => { state.settings.autoDownload = event.target.checked; save(state); };
