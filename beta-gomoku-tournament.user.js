@@ -31,7 +31,10 @@
   function load() {
     try {
       const state = JSON.parse(localStorage.getItem(KEY) || 'null');
-      if (state) state.settings = Object.assign({ autoDownload: true, autoNext: false }, state.settings);
+      if (state) {
+        state.settings = Object.assign({ autoDownload: true, autoNext: false }, state.settings);
+        state.archives = Object.assign({ group: false, final: false }, state.archives);
+      }
       return state;
     }
     catch (error) { console.error(error); return null; }
@@ -88,7 +91,8 @@
     });
     return {
       format: 'beta-gomoku-page-record-2.0', createdAt: new Date().toISOString(), seed, roster: people,
-      ties, groups, groupFixtures, knockout: null, events: [], waiting: null, settings: { autoDownload: true, autoNext: false }
+      ties, groups, groupFixtures, knockout: null, events: [], waiting: null,
+      archives: { group: false, final: false }, settings: { autoDownload: true, autoNext: false }
     };
   }
 
@@ -112,6 +116,23 @@
       (a.blackAverage == null ? Infinity : a.blackAverage) - (b.blackAverage == null ? Infinity : b.blackAverage) || a.tie - b.tie);
   }
   function groupsDone(state) { return state.groupFixtures.every(item => item.status === 'done'); }
+  function qualification(state) {
+    const rankedGroups = state.groups.map(group => ({ group, rows: rank(groupRows(state, group)) }));
+    const entrants = rankedGroups.map(item => {
+      const row = item.rows[0];
+      return {
+        uid: row.uid, group: item.group.name, rank: 1,
+        reason: '小组 ' + item.group.name + ' 第一（总胜 ' + row.wins + '，白胜 ' + row.whiteWins + '，黑胜均手 ' + (row.blackAverage == null ? '—' : row.blackAverage.toFixed(2)) + '）'
+      };
+    });
+    const secondRows = rankedGroups.map(item => Object.assign({}, item.rows[1], { group: item.group.name }));
+    const rankedSeconds = rank(secondRows);
+    rankedSeconds.slice(0, 3).forEach((row, index) => entrants.push({
+      uid: row.uid, group: row.group, rank: 2,
+      reason: '小组 ' + row.group + ' 第二；五个小组第二横向比较第 ' + (index + 1) + ' 名（总胜 ' + row.wins + '，白胜 ' + row.whiteWins + '，黑胜均手 ' + (row.blackAverage == null ? '—' : row.blackAverage.toFixed(2)) + '）'
+    }));
+    return { entrants, rankedGroups, rankedSeconds };
+  }
   function pairGroups(entries, random) {
     const pairs = [];
     function search(rest) {
@@ -129,11 +150,9 @@
     return pairs;
   }
   function prepareKnockout(state) {
-    if (state.knockout || !groupsDone(state)) return;
-    const ranks = state.groups.map(group => ({ group, rows: rank(groupRows(state, group)) }));
-    const entrants = ranks.map(item => ({ uid: item.rows[0].uid, group: item.group.name }));
-    rank(ranks.map(item => Object.assign({}, item.rows[1], { group: item.group.name }))).slice(0, 3)
-      .forEach(item => entrants.push({ uid: item.uid, group: item.group }));
+    if (state.knockout) return;
+    if (!groupsDone(state)) throw new Error('小组赛尚未完成，不能进入淘汰赛。');
+    const entrants = qualification(state).entrants;
     state.knockout = {
       entrants, champion: null,
       rounds: [pairGroups(entrants, rng(state.seed + ':knockout')).map((pair, n) => ({
@@ -173,7 +192,7 @@
   function nextFixture(state) {
     const group = state.groupFixtures.find(item => item.status !== 'done');
     if (group) return group;
-    prepareKnockout(state);
+    if (!state.knockout) return null;
     if (state.knockout.champion) return null;
     const fixture = state.knockout.rounds.at(-1).find(item => item.status !== 'done');
     if (fixture) return fixture;
@@ -310,6 +329,32 @@
     ])));
     return rows.map(row => row.map(value => '"' + String(value == null ? '' : value).replaceAll('"', '""') + '"').join(',')).join('\n');
   }
+  function downloadArchive(state, stage) {
+    const suffix = stage === 'group' ? 'group-stage-complete' : 'tournament-complete';
+    download('betagomoku-' + suffix + '.json', 'application/json;charset=utf-8', JSON.stringify(state, null, 2));
+    download('betagomoku-' + suffix + '.csv', 'text/csv;charset=utf-8', '\uFEFF' + toCsv(state));
+  }
+  function archiveOnce(state, stage) {
+    if (state.archives[stage]) return;
+    state.archives[stage] = true;
+    state.events.push({ type: stage + '_archive_created', at: new Date().toISOString() });
+    save(state);
+    downloadArchive(state, stage);
+  }
+  function finishGroupStage(state) {
+    if (state.groupFinishedAt || !groupsDone(state)) return;
+    state.groupFinishedAt = new Date().toISOString();
+    state.events.push({ type: 'group_stage_finished', at: state.groupFinishedAt, entrants: qualification(state).entrants });
+    save(state);
+    archiveOnce(state, 'group');
+  }
+  function finishTournament(state) {
+    if (!state.knockout?.champion || state.finishedAt) return;
+    state.finishedAt = new Date().toISOString();
+    state.events.push({ type: 'tournament_finished', at: state.finishedAt, champion: state.knockout.champion });
+    save(state);
+    archiveOnce(state, 'final');
+  }
   function scheduleAutoNext(state) {
     clearTimeout(autoNextTimer);
     tell('本局记录已保存；自动模式将在 3 秒后开始下一局。');
@@ -323,7 +368,11 @@
   async function runOne(state) {
     if (active) return;
     const fixture = nextFixture(state);
-    if (!fixture) { render(state); tell('赛事已结束，冠军：' + state.knockout.champion); return; }
+    if (!fixture) {
+      render(state);
+      tell(!state.knockout ? '小组赛已完成；请核对晋级名单后点击“进入淘汰赛”。' : '赛事已结束，冠军：' + state.knockout.champion);
+      return;
+    }
     const number = fixture.games.length + 1;
     const [first, second] = fixture.players;
     const [black, white] = number === 1 ? [first, second] : [second, first];
@@ -345,11 +394,16 @@
           advance(state);
         }
       }
-      autoNext = Boolean(state.settings.autoNext);
-      state.waiting = { fixture: fixture.id, game: number, at: game.finishedAt, message: fixture.round + ' 第 ' + number + ' 局已结束；' + (autoNext ? '自动模式将在 3 秒后继续。' : '点击“开始下一局”继续。') };
+      const groupComplete = fixture.phase === 'group' && groupsDone(state);
+      const tournamentComplete = Boolean(state.knockout?.champion);
+      autoNext = Boolean(state.settings.autoNext) && !groupComplete && !tournamentComplete;
+      const nextMessage = groupComplete ? '小组赛已全部完成，已自动导出总记录；请核对晋级名单后点击“进入淘汰赛”。' : (tournamentComplete ? '赛事已全部完成，已自动导出总记录；最终榜单见下方。' : (autoNext ? '自动模式将在 3 秒后继续。' : '点击“开始下一局”继续。'));
+      state.waiting = { fixture: fixture.id, game: number, at: game.finishedAt, message: fixture.round + ' 第 ' + number + ' 局已结束；' + nextMessage };
       state.events.push({ type: 'game_finished', at: game.finishedAt, fixture: fixture.id, game: number, result: game });
       save(state);
       if (state.settings.autoDownload) download('betagomoku-' + fixture.id + '-game-' + number + '.json', 'application/json;charset=utf-8', JSON.stringify(record(state, fixture, game, number), null, 2));
+      if (groupComplete) finishGroupStage(state);
+      if (tournamentComplete) finishTournament(state);
       render(state);
       tell(state.waiting.message);
     } catch (error) {
@@ -384,6 +438,27 @@
     });
     return html + (state.knockout.champion ? '<p>冠军：<b>' + esc(state.knockout.champion) + '</b></p>' : '') + '</section>';
   }
+  function qualificationHtml(state) {
+    if (!groupsDone(state)) return '';
+    const entrants = state.knockout ? state.knockout.entrants : qualification(state).entrants;
+    let html = '<section class="bgta-qualification"><h3>八强晋级名单</h3><p>小组赛已封存；请核对后再进入淘汰赛。</p><ol>';
+    entrants.forEach(entry => { html += '<li><b>' + esc(entry.uid) + '</b>（小组 ' + esc(entry.group) + '）<small>' + esc(entry.reason || '八强参赛者') + '</small></li>'; });
+    return html + '</ol></section>';
+  }
+  function leaderboardHtml(state) {
+    if (!state.knockout?.champion) return '';
+    const rounds = state.knockout.rounds;
+    const final = rounds.at(-1)[0];
+    const runnerUp = final.players.find(uid => uid !== state.knockout.champion);
+    const semiFinals = rounds.find(round => round.length === 2) || [];
+    const quarterFinals = rounds[0] || [];
+    const semifinalists = semiFinals.map(item => item.players.find(uid => uid !== item.winner));
+    const quarterfinalists = quarterFinals.map(item => item.players.find(uid => uid !== item.winner));
+    let html = '<section class="bgta-leaderboard"><h3>最终榜单</h3><ol><li><b>冠军：' + esc(state.knockout.champion) + '</b></li><li><b>亚军：' + esc(runnerUp) + '</b></li>';
+    semifinalists.forEach(uid => { html += '<li>并列四强：' + esc(uid) + '</li>'; });
+    quarterfinalists.forEach(uid => { html += '<li>八强：' + esc(uid) + '</li>'; });
+    return html + '</ol><small>没有三、四名决赛时，半决赛负者并列四强；四分之一决赛负者列为八强。</small></section>';
+  }
   function latestResultHtml(state) {
     const event = state.events.slice().reverse().find(item => item.type === 'game_finished');
     if (!event) return '<section class="bgta-result"><h3>最近终局</h3><p>尚无已完成对局。</p></section>';
@@ -412,19 +487,21 @@
     const groupGames = state.groupFixtures.reduce((sum, item) => sum + item.games.length, 0);
     const totalGames = fixtures(state).reduce((sum, item) => sum + item.games.length, 0);
     const waiting = state.waiting ? state.waiting.message : (active ? '网页正在执行当前局…' : '准备开始下一局。');
-    panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p class="bgta-waiting">' + esc(waiting) + '</p><p>小组赛 ' + groupGames + '/60 局；全赛事 ' + totalGames + '/74 局。</p><div class="bgta-actions"><button id="bgta-next" ' + (active ? 'disabled' : '') + '>开始下一局</button><button id="bgta-auto-next" ' + (active ? 'disabled' : '') + '>' + (state.settings.autoNext ? '自动开始：开（点击关闭）' : '自动开始：关（点击开启）') + '</button><button id="bgta-json">导出完整 JSON</button><button id="bgta-csv">导出 CSV</button><button id="bgta-bracket">生成八强签表</button><button id="bgta-reset">清除本机赛事</button></div><label class="bgta-check"><input id="bgta-auto" type="checkbox" ' + (state.settings.autoDownload ? 'checked' : '') + '> 每局结束自动下载完整 JSON 记录</label><p id="bgta-status"></p>' + latestResultHtml(state) + '<div class="bgta-groups">' + state.groups.map(group => groupHtml(state, group)).join('') + '</div>' + knockoutHtml(state);
-    $id('bgta-next').onclick = () => runOne(state);
+    const enterKnockout = groupsDone(state) && !state.knockout;
+    const phaseButton = enterKnockout ? '<button id="bgta-enter-knockout" ' + (active ? 'disabled' : '') + '>进入淘汰赛</button>' : '<button id="bgta-next" ' + (active || state.knockout?.champion ? 'disabled' : '') + '>开始下一局</button>';
+    panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p class="bgta-waiting">' + esc(waiting) + '</p><p>小组赛 ' + groupGames + '/60 局；全赛事 ' + totalGames + '/74 局。</p><div class="bgta-actions">' + phaseButton + '<button id="bgta-auto-next" ' + (active || enterKnockout || state.knockout?.champion ? 'disabled' : '') + '>' + (state.settings.autoNext ? '自动开始：开（点击关闭）' : '自动开始：关（点击开启）') + '</button><button id="bgta-json">导出完整 JSON</button><button id="bgta-csv">导出 CSV</button><button id="bgta-reset">清除本机赛事</button></div><label class="bgta-check"><input id="bgta-auto" type="checkbox" ' + (state.settings.autoDownload ? 'checked' : '') + '> 每局结束自动下载完整 JSON 记录</label><p id="bgta-status"></p>' + latestResultHtml(state) + leaderboardHtml(state) + qualificationHtml(state) + knockoutHtml(state) + '<div class="bgta-groups">' + state.groups.map(group => groupHtml(state, group)).join('') + '</div>';
+    if ($id('bgta-next')) $id('bgta-next').onclick = () => runOne(state);
+    if ($id('bgta-enter-knockout')) $id('bgta-enter-knockout').onclick = () => { try { prepareKnockout(state); save(state); render(state); tell('八强签表已生成；点击“开始下一局”进入淘汰赛。'); } catch (error) { tell(error.message || String(error), true); } };
     $id('bgta-auto-next').onclick = () => { state.settings.autoNext = !state.settings.autoNext; save(state); render(state); tell(state.settings.autoNext ? '已开启自动开始：每局终局展示 3 秒后继续。' : '已关闭自动开始：下一局需手动点击。'); };
     $id('bgta-json').onclick = () => download('betagomoku-tournament.json', 'application/json;charset=utf-8', JSON.stringify(state, null, 2));
     $id('bgta-csv').onclick = () => download('betagomoku-games.csv', 'text/csv;charset=utf-8', '\uFEFF' + toCsv(state));
     $id('bgta-auto').onchange = event => { state.settings.autoDownload = event.target.checked; save(state); };
-    $id('bgta-bracket').onclick = () => { try { prepareKnockout(state); render(state); tell('八强签表已生成。'); } catch (error) { tell(error.message || String(error), true); } };
     $id('bgta-reset').onclick = () => { if (confirm('仅清除本浏览器保存的赛程、赛果和名单，确定吗？')) { localStorage.removeItem(KEY); render(null); } };
   }
   function mount() {
     if ($id('bgta-launch')) return;
     const style = document.createElement('style');
-    style.textContent = '#bgta-launch{position:fixed;z-index:10000;right:20px;bottom:20px;border:0;border-radius:999px;padding:12px 16px;background:#175cd3;color:#fff;font-weight:700;box-shadow:0 3px 12px #0005;cursor:pointer}#bgta-panel{position:fixed;z-index:10001;right:20px;top:60px;width:min(660px,calc(100vw - 40px));max-height:calc(100vh - 90px);overflow:auto;padding:18px;border:1px solid #d0d5dd;border-radius:12px;background:#fff;color:#182230;box-shadow:0 8px 30px #0004;font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}#bgta-panel h2{margin:0 0 8px}#bgta-panel h3{margin:12px 0 4px;color:#175cd3}#bgta-panel textarea{width:100%;height:160px;margin:8px 0;box-sizing:border-box}#bgta-panel button{margin:4px 6px 4px 0;padding:7px 10px;border:1px solid #98a2b3;border-radius:6px;background:#fff;cursor:pointer}#bgta-panel #bgta-next{background:#175cd3;color:#fff;border-color:#175cd3}#bgta-panel button:disabled{opacity:.55;cursor:wait}.bgta-waiting{font-weight:700}.bgta-check{display:block;margin:8px 0}.bgta-result{margin:10px 0;padding:10px;border:1px solid #b2ddff;border-radius:8px;background:#eff8ff}.bgta-result h3{margin-top:0}.bgta-result p{margin:4px 0}.bgta-winner{font-weight:700;color:#175cd3}.bgta-fatal{border-color:#fecdca;background:#fef3f2}.bgta-fatal-text{font-weight:700;color:#b42318}.bgta-result details{margin-top:6px}.bgta-result ul{margin:4px 0;padding-left:20px}.bgta-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.bgta-group{border:1px solid #e4e7ec;border-radius:8px;padding:7px}.bgta-group h3{margin-top:0}#bgta-panel table{width:100%;border-collapse:collapse;font-size:12px}#bgta-panel th,#bgta-panel td{padding:2px;text-align:right;border-top:1px solid #eef1f4}#bgta-panel th:first-child,#bgta-panel td:first-child,#bgta-panel th:nth-child(2),#bgta-panel td:nth-child(2){text-align:left}.leader{font-weight:700;color:#175cd3}.bgta-group small,.bgta-fixture small{display:block;color:#667085;font-size:11px}.bgta-knockout{margin-top:10px}.bgta-fixture{padding:6px 0;border-top:1px solid #e4e7ec}.bgta-fixture strong{float:right;color:#8a5a00}';
+    style.textContent = '#bgta-launch{position:fixed;z-index:10000;right:20px;bottom:20px;border:0;border-radius:999px;padding:12px 16px;background:#175cd3;color:#fff;font-weight:700;box-shadow:0 3px 12px #0005;cursor:pointer}#bgta-panel{position:fixed;z-index:10001;right:20px;top:60px;width:min(660px,calc(100vw - 40px));max-height:calc(100vh - 90px);overflow:auto;padding:18px;border:1px solid #d0d5dd;border-radius:12px;background:#fff;color:#182230;box-shadow:0 8px 30px #0004;font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}#bgta-panel h2{margin:0 0 8px}#bgta-panel h3{margin:12px 0 4px;color:#175cd3}#bgta-panel textarea{width:100%;height:160px;margin:8px 0;box-sizing:border-box}#bgta-panel button{margin:4px 6px 4px 0;padding:7px 10px;border:1px solid #98a2b3;border-radius:6px;background:#fff;cursor:pointer}#bgta-panel #bgta-next,#bgta-panel #bgta-enter-knockout{background:#175cd3;color:#fff;border-color:#175cd3}#bgta-panel button:disabled{opacity:.55;cursor:wait}.bgta-waiting{font-weight:700}.bgta-check{display:block;margin:8px 0}.bgta-result,.bgta-qualification,.bgta-leaderboard{margin:10px 0;padding:10px;border:1px solid #b2ddff;border-radius:8px;background:#eff8ff}.bgta-result h3,.bgta-qualification h3,.bgta-leaderboard h3{margin-top:0}.bgta-result p,.bgta-qualification p{margin:4px 0}.bgta-winner{font-weight:700;color:#175cd3}.bgta-fatal{border-color:#fecdca;background:#fef3f2}.bgta-fatal-text{font-weight:700;color:#b42318}.bgta-result details{margin-top:6px}.bgta-result ul,.bgta-qualification ol,.bgta-leaderboard ol{margin:4px 0;padding-left:20px}.bgta-qualification small{display:block;color:#475467}.bgta-leaderboard{border-color:#fedf89;background:#fffaeb}.bgta-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.bgta-group{border:1px solid #e4e7ec;border-radius:8px;padding:7px}.bgta-group h3{margin-top:0}#bgta-panel table{width:100%;border-collapse:collapse;font-size:12px}#bgta-panel th,#bgta-panel td{padding:2px;text-align:right;border-top:1px solid #eef1f4}#bgta-panel th:first-child,#bgta-panel td:first-child,#bgta-panel th:nth-child(2),#bgta-panel td:nth-child(2){text-align:left}.leader{font-weight:700;color:#175cd3}.bgta-group small,.bgta-fixture small{display:block;color:#667085;font-size:11px}.bgta-knockout{margin-top:10px}.bgta-fixture{padding:6px 0;border-top:1px solid #e4e7ec}.bgta-fixture strong{float:right;color:#8a5a00}';
     document.head.append(style);
     const button = document.createElement('button');
     button.id = 'bgta-launch';
