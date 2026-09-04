@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         BetaGomoku 赛事助手（真实 Start）
 // @namespace    ruc-gomoku-ta
-// @version      2.0.0
+// @version      2.5.0
 // @description  驱动网页真实 Start，保存本地完整赛果、计分板和棋谱。
 // @match        http://gomoku.ruc.rvalue.moe/*
 // @run-at       document-idle
+// @noframes
 // @grant        none
 // ==/UserScript==
 
@@ -16,8 +17,17 @@
 (() => {
   'use strict';
 
+  const SCRIPT_VERSION = '2.5.0';
+  if (window.__bgtaTournamentAssistantVersion) {
+    console.warn('BetaGomoku 赛事助手已加载，忽略重复注入。当前版本：', window.__bgtaTournamentAssistantVersion);
+    return;
+  }
+  window.__bgtaTournamentAssistantVersion = SCRIPT_VERSION;
+
   const KEY = 'ruc-betagomoku-real-start-v2';
   const LOCK_KEY = KEY + ':run-lock';
+  const ARCHIVE_DB = 'ruc-betagomoku-full-games-v1';
+  const ARCHIVE_STORE = 'games';
   const INSTANCE_ID = 'tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
   const LOCK_LEASE_MS = 3 * 60 * 1000;
   const $id = id => document.getElementById(id);
@@ -30,8 +40,48 @@
   let drawHooked = false;
   let autoNextTimer = null;
   let lockPulse = null;
+  let migrationError = null;
+  let migrationPromise = Promise.resolve();
 
-  function save(state) { localStorage.setItem(KEY, JSON.stringify(state)); }
+  function save(state) {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); }
+    catch (error) {
+      if (state?.settings) state.settings.autoNext = false;
+      throw new Error('赛事状态写入失败，已停止自动续局：' + (error?.name || error));
+    }
+  }
+  function archiveDb() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(ARCHIVE_DB, 1);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(ARCHIVE_STORE)) request.result.createObjectStore(ARCHIVE_STORE, { keyPath: 'key' });
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error('无法打开完整棋谱数据库'));
+    });
+  }
+  async function putArchive(key, record) {
+    const db = await archiveDb();
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction(ARCHIVE_STORE, 'readwrite');
+        transaction.objectStore(ARCHIVE_STORE).put({ key, record });
+        transaction.oncomplete = resolve;
+        transaction.onerror = () => reject(transaction.error || new Error('完整棋谱写入失败'));
+        transaction.onabort = () => reject(transaction.error || new Error('完整棋谱写入中止'));
+      });
+    } finally { db.close(); }
+  }
+  async function getArchive(key) {
+    const db = await archiveDb();
+    try {
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction(ARCHIVE_STORE, 'readonly').objectStore(ARCHIVE_STORE).get(key);
+        request.onsuccess = () => resolve(request.result?.record || null);
+        request.onerror = () => reject(request.error || new Error('完整棋谱读取失败'));
+      });
+    } finally { db.close(); }
+  }
   function readRunLock() {
     try { return JSON.parse(localStorage.getItem(LOCK_KEY) || 'null'); }
     catch (_) { return null; }
@@ -330,6 +380,63 @@
   }
 
   function fixtures(state) { return state.groupFixtures.concat(state.knockout ? state.knockout.rounds.flat() : []); }
+  function gameArchiveKey(state, fixture, number) { return state.createdAt + ':' + fixture.id + ':game:' + number; }
+  function compactGame(game, archiveKey) {
+    return {
+      black: game.black, white: game.white, winner: game.winner, moves: game.moves,
+      history: game.history, reason: game.reason, pageMessage: game.pageMessage,
+      pageMessages: game.pageMessages, finishedAt: game.finishedAt, archiveKey,
+      executions: (game.executions || []).map(item => ({
+        at: item.at, uid: item.uid || null, color: item.color,
+        response: item.response || null, transportError: item.transportError || null
+      }))
+    };
+  }
+  function gameEventSummary(game) {
+    return {
+      black: game.black, white: game.white, winner: game.winner,
+      moves: game.moves, reason: game.reason, finishedAt: game.finishedAt,
+      archiveKey: game.archiveKey || null
+    };
+  }
+  async function fullTournament(state) {
+    const full = JSON.parse(JSON.stringify(state));
+    for (const fixture of fixtures(full)) {
+      for (let index = 0; index < fixture.games.length; index += 1) {
+        const game = fixture.games[index];
+        if (!game.archiveKey) continue;
+        const archived = await getArchive(game.archiveKey);
+        if (!archived?.game) throw new Error('完整棋谱缺失：' + game.archiveKey + '。为避免导出不完整记录，本次导出已停止。');
+        fixture.games[index] = archived.game;
+      }
+    }
+    return full;
+  }
+  async function migrateLargeState() {
+    const state = load();
+    if (!state) return;
+    let changed = false;
+    for (const fixture of fixtures(state)) {
+      for (let index = 0; index < fixture.games.length; index += 1) {
+        const game = fixture.games[index];
+        if (game.archiveKey || !(game.executions || []).some(item => item.input)) continue;
+        const key = gameArchiveKey(state, fixture, index + 1);
+        await putArchive(key, record(state, fixture, game, index + 1));
+        fixture.games[index] = compactGame(game, key);
+        changed = true;
+      }
+    }
+    (state.events || []).forEach(event => {
+      if (event.type === 'game_finished' && event.result && (event.result.history || event.result.executions)) {
+        event.result = gameEventSummary(event.result);
+        changed = true;
+      }
+    });
+    if (changed) {
+      state.events.push({ type: 'large_state_migrated_to_indexeddb', at: new Date().toISOString() });
+      save(state);
+    }
+  }
   function download(name, mime, text) {
     const blob = new Blob([text], { type: mime });
     const link = document.createElement('a');
@@ -353,31 +460,32 @@
     ])));
     return rows.map(row => row.map(value => '"' + String(value == null ? '' : value).replaceAll('"', '""') + '"').join(',')).join('\n');
   }
-  function downloadArchive(state, stage) {
+  async function downloadArchive(state, stage) {
     const suffix = stage === 'group' ? 'group-stage-complete' : 'tournament-complete';
-    download('betagomoku-' + suffix + '.json', 'application/json;charset=utf-8', JSON.stringify(state, null, 2));
+    const full = await fullTournament(state);
+    download('betagomoku-' + suffix + '.json', 'application/json;charset=utf-8', JSON.stringify(full, null, 2));
     download('betagomoku-' + suffix + '.csv', 'text/csv;charset=utf-8', '\uFEFF' + toCsv(state));
   }
-  function archiveOnce(state, stage) {
+  async function archiveOnce(state, stage) {
     if (state.archives[stage]) return;
+    await downloadArchive(state, stage);
     state.archives[stage] = true;
     state.events.push({ type: stage + '_archive_created', at: new Date().toISOString() });
     save(state);
-    downloadArchive(state, stage);
   }
-  function finishGroupStage(state) {
+  async function finishGroupStage(state) {
     if (state.groupFinishedAt || !groupsDone(state)) return;
     state.groupFinishedAt = new Date().toISOString();
     state.events.push({ type: 'group_stage_finished', at: state.groupFinishedAt, entrants: qualification(state).entrants });
     save(state);
-    archiveOnce(state, 'group');
+    await archiveOnce(state, 'group');
   }
-  function finishTournament(state) {
+  async function finishTournament(state) {
     if (!state.knockout?.champion || state.finishedAt) return;
     state.finishedAt = new Date().toISOString();
     state.events.push({ type: 'tournament_finished', at: state.finishedAt, champion: state.knockout.champion });
     save(state);
-    archiveOnce(state, 'final');
+    await archiveOnce(state, 'final');
   }
   function scheduleAutoNext(state) {
     clearTimeout(autoNextTimer);
@@ -391,6 +499,19 @@
   }
   async function runOne(state) {
     if (active) return;
+    await migrationPromise;
+    if (migrationError) {
+      render(load());
+      tell('旧记录迁移失败，赛事未启动：' + (migrationError.message || migrationError), true);
+      return;
+    }
+    const latest = load();
+    if (latest?.createdAt === state.createdAt) state = latest;
+    if (state.inFlight) {
+      render(state);
+      tell('检测到上一局尚未完整落盘。为防止重复比赛，自动开始已停止；请先点击“废弃未完成局”，再手动开始一次。', true);
+      return;
+    }
     if (!claimRunLock()) {
       render(state);
       tell('另一页面或另一份赛事脚本正在执行本届比赛；为避免重复对局，本页面未启动。请关闭重复标签页/旧脚本，或等待 3 分钟锁自动失效。', true);
@@ -407,16 +528,31 @@
     const number = fixture.games.length + 1;
     const [first, second] = fixture.players;
     const [black, white] = number === 1 ? [first, second] : [second, first];
+    const attemptId = 'attempt-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
     fixture.status = 'running';
     state.waiting = null;
-    state.events.push({ type: 'game_started', at: new Date().toISOString(), fixture: fixture.id, game: number, black, white });
-    save(state);
+    state.inFlight = { attemptId, fixture: fixture.id, game: number, black, white, startedAt: new Date().toISOString() };
+    state.events.push({ type: 'game_started', at: state.inFlight.startedAt, attemptId, fixture: fixture.id, game: number, black, white });
+    try { save(state); }
+    catch (error) {
+      state.settings.autoNext = false;
+      releaseRunLock();
+      render(state);
+      tell(error.message || String(error), true);
+      return;
+    }
     active = true;
     render(state);
     tell(fixture.round + ' 第 ' + number + '/2 局：' + black + ' 黑 vs ' + white + ' 白；正在运行网页 Start。');
     let autoNext = false;
+    let committed = false;
     try {
-      const game = await realGame(black, white);
+      const fullGame = await realGame(black, white);
+      const archiveKey = gameArchiveKey(state, fixture, number);
+      const fullRecord = record(state, fixture, fullGame, number);
+      await putArchive(archiveKey, fullRecord);
+      const game = compactGame(fullGame, archiveKey);
+      delete state.inFlight;
       fixture.games.push(game);
       if (fixture.games.length === 2) {
         fixture.status = 'done';
@@ -430,18 +566,34 @@
       autoNext = Boolean(state.settings.autoNext) && !groupComplete && !tournamentComplete;
       const nextMessage = groupComplete ? '小组赛已全部完成，已自动导出总记录；请核对晋级名单后点击“进入淘汰赛”。' : (tournamentComplete ? '赛事已全部完成，已自动导出总记录；最终榜单见下方。' : (autoNext ? '自动模式将在 3 秒后继续。' : '点击“开始下一局”继续。'));
       state.waiting = { fixture: fixture.id, game: number, at: game.finishedAt, message: fixture.round + ' 第 ' + number + ' 局已结束；' + nextMessage };
-      state.events.push({ type: 'game_finished', at: game.finishedAt, fixture: fixture.id, game: number, result: game });
+      state.events.push({ type: 'game_finished', at: game.finishedAt, attemptId, fixture: fixture.id, game: number, result: gameEventSummary(game) });
       save(state);
-      if (state.settings.autoDownload) download('betagomoku-' + fixture.id + '-game-' + number + '.json', 'application/json;charset=utf-8', JSON.stringify(record(state, fixture, game, number), null, 2));
-      if (groupComplete) finishGroupStage(state);
-      if (tournamentComplete) finishTournament(state);
+      committed = true;
+      if (state.settings.autoDownload) download('betagomoku-' + fixture.id + '-game-' + number + '.json', 'application/json;charset=utf-8', JSON.stringify(fullRecord, null, 2));
+      if (groupComplete) await finishGroupStage(state);
+      if (tournamentComplete) await finishTournament(state);
       render(state);
       tell(state.waiting.message);
     } catch (error) {
-      state.events.push({ type: 'game_aborted', at: new Date().toISOString(), fixture: fixture.id, game: number, error: String(error) });
-      save(state);
+      autoNext = false;
+      if (committed) {
+        state.settings.autoNext = false;
+        try { save(state); } catch (saveError) { console.error('终局已记分，但停止自动续局时保存失败', saveError); }
+        render(state);
+        tell('本局已经记分，但后续导出/封存失败，已停止自动续局：' + (error.message || error), true);
+        return;
+      }
+      const persisted = load();
+      if (persisted?.createdAt === state.createdAt) state = persisted;
+      delete state.inFlight;
+      state.settings.autoNext = false;
+      const persistedFixture = fixtures(state).find(item => item.id === fixture.id);
+      if (persistedFixture?.status === 'running') persistedFixture.status = persistedFixture.games.length >= 2 ? 'done' : 'pending';
+      state.events.push({ type: 'game_aborted', at: new Date().toISOString(), attemptId, fixture: fixture.id, game: number, error: String(error) });
+      try { save(state); }
+      catch (saveError) { console.error('保存停赛状态失败', saveError); }
       render(state);
-      tell('本局未记分：' + (error.message || error), true);
+      tell('本局未记分，自动续局已停止：' + (error.message || error), true);
     } finally {
       active = false;
       releaseRunLock();
@@ -509,7 +661,7 @@
     const panel = $id('bgta-panel');
     if (!panel) return;
     if (!state) {
-      panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p>本版本只驱动网页真实 Start；网页是单局裁判。</p><textarea id="bgta-roster" placeholder="粘贴 20 个学号，每行一个"></textarea><label>抽签种子 <input id="bgta-seed" value="' + new Date().toISOString().slice(0, 10) + '"></label><button id="bgta-create">随机分组</button><p id="bgta-status"></p>';
+      panel.innerHTML = '<h2>BetaGomoku 赛事助手 v' + SCRIPT_VERSION + '</h2><p>本版本只驱动网页真实 Start；网页是单局裁判。</p><textarea id="bgta-roster" placeholder="粘贴 20 个学号，每行一个"></textarea><label>抽签种子 <input id="bgta-seed" value="' + new Date().toISOString().slice(0, 10) + '"></label><button id="bgta-create">随机分组</button><p id="bgta-status"></p>';
       $id('bgta-create').onclick = () => {
         try { const state = createState(parseRoster($id('bgta-roster').value), $id('bgta-seed').value.trim() || Date.now()); save(state); render(state); tell('分组已保存。点击“开始下一局”启动首局。'); }
         catch (error) { tell(error.message || String(error), true); }
@@ -518,17 +670,36 @@
     }
     const groupGames = state.groupFixtures.reduce((sum, item) => sum + item.games.length, 0);
     const totalGames = fixtures(state).reduce((sum, item) => sum + item.games.length, 0);
-    const waiting = state.waiting ? state.waiting.message : (active ? '网页正在执行当前局…' : '准备开始下一局。');
+    const interrupted = Boolean(state.inFlight) && !active;
+    const waiting = interrupted ? '检测到未完整结束的对局：' + state.inFlight.black + ' 黑 vs ' + state.inFlight.white + ' 白。不会自动重开。' : (state.waiting ? state.waiting.message : (active ? '网页正在执行当前局…' : '准备开始下一局。'));
     const enterKnockout = groupsDone(state) && !state.knockout;
-    const phaseButton = enterKnockout ? '<button id="bgta-enter-knockout" ' + (active ? 'disabled' : '') + '>进入淘汰赛</button>' : '<button id="bgta-next" ' + (active || state.knockout?.champion ? 'disabled' : '') + '>开始下一局</button>';
-    panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p class="bgta-waiting">' + esc(waiting) + '</p><p>小组赛 ' + groupGames + '/60 局；全赛事 ' + totalGames + '/74 局。</p><div class="bgta-actions">' + phaseButton + '<button id="bgta-auto-next" ' + (active || enterKnockout || state.knockout?.champion ? 'disabled' : '') + '>' + (state.settings.autoNext ? '自动开始：开（点击关闭）' : '自动开始：关（点击开启）') + '</button><button id="bgta-json">导出完整 JSON</button><button id="bgta-csv">导出 CSV</button><button id="bgta-reset">清除本机赛事</button></div><label class="bgta-check"><input id="bgta-auto" type="checkbox" ' + (state.settings.autoDownload ? 'checked' : '') + '> 每局结束自动下载完整 JSON 记录</label><p id="bgta-status"></p>' + latestResultHtml(state) + leaderboardHtml(state) + qualificationHtml(state) + knockoutHtml(state) + '<div class="bgta-groups">' + state.groups.map(group => groupHtml(state, group)).join('') + '</div>';
+    const phaseButton = interrupted ? '<button id="bgta-discard-inflight">废弃未完成局</button>' : (enterKnockout ? '<button id="bgta-enter-knockout" ' + (active ? 'disabled' : '') + '>进入淘汰赛</button>' : '<button id="bgta-next" ' + (active || state.knockout?.champion ? 'disabled' : '') + '>开始下一局</button>');
+    panel.innerHTML = '<h2>BetaGomoku 赛事助手 v' + SCRIPT_VERSION + '</h2><p class="bgta-waiting">' + esc(waiting) + '</p><p>小组赛 ' + groupGames + '/60 局；全赛事 ' + totalGames + '/74 局。</p><div class="bgta-actions">' + phaseButton + '<button id="bgta-auto-next" ' + (active || interrupted || enterKnockout || state.knockout?.champion ? 'disabled' : '') + '>' + (state.settings.autoNext ? '自动开始：开（点击关闭）' : '自动开始：关（点击开启）') + '</button><button id="bgta-json">导出完整 JSON</button><button id="bgta-csv">导出 CSV</button><button id="bgta-reset">清除本机赛事</button></div><label class="bgta-check"><input id="bgta-auto" type="checkbox" ' + (state.settings.autoDownload ? 'checked' : '') + '> 每局结束自动下载完整 JSON 记录</label><p id="bgta-status"></p>' + latestResultHtml(state) + leaderboardHtml(state) + qualificationHtml(state) + knockoutHtml(state) + '<div class="bgta-groups">' + state.groups.map(group => groupHtml(state, group)).join('') + '</div>';
     if ($id('bgta-next')) $id('bgta-next').onclick = () => runOne(state);
+    if ($id('bgta-discard-inflight')) $id('bgta-discard-inflight').onclick = () => {
+      const abandoned = state.inFlight;
+      delete state.inFlight;
+      state.settings.autoNext = false;
+      state.events.push({ type: 'game_abandoned_after_interruption', at: new Date().toISOString(), attempt: abandoned });
+      state.waiting = { message: '未完成局已废弃；历史赛果保留。请手动点击“开始下一局”重开这一局。', at: new Date().toISOString() };
+      localStorage.removeItem(LOCK_KEY);
+      save(state);
+      render(state);
+      tell(state.waiting.message);
+    };
     if ($id('bgta-enter-knockout')) $id('bgta-enter-knockout').onclick = () => { try { prepareKnockout(state); save(state); render(state); tell('八强签表已生成；点击“开始下一局”进入淘汰赛。'); } catch (error) { tell(error.message || String(error), true); } };
     $id('bgta-auto-next').onclick = () => { state.settings.autoNext = !state.settings.autoNext; save(state); render(state); tell(state.settings.autoNext ? '已开启自动开始：每局终局展示 3 秒后继续。' : '已关闭自动开始：下一局需手动点击。'); };
-    $id('bgta-json').onclick = () => download('betagomoku-tournament.json', 'application/json;charset=utf-8', JSON.stringify(state, null, 2));
+    $id('bgta-json').onclick = async () => {
+      tell('正在从本机完整棋谱库组装 JSON…');
+      try {
+        const full = await fullTournament(state);
+        download('betagomoku-tournament.json', 'application/json;charset=utf-8', JSON.stringify(full, null, 2));
+        tell('完整 JSON 已生成并开始下载。');
+      } catch (error) { tell('完整 JSON 导出失败：' + (error.message || error), true); }
+    };
     $id('bgta-csv').onclick = () => download('betagomoku-games.csv', 'text/csv;charset=utf-8', '\uFEFF' + toCsv(state));
     $id('bgta-auto').onchange = event => { state.settings.autoDownload = event.target.checked; save(state); };
-    $id('bgta-reset').onclick = () => { if (confirm('仅清除本浏览器保存的赛程、赛果和名单，确定吗？')) { localStorage.removeItem(KEY); render(null); } };
+    $id('bgta-reset').onclick = () => { if (confirm('仅清除本浏览器保存的赛程、赛果和名单，确定吗？')) { localStorage.removeItem(KEY); localStorage.removeItem(LOCK_KEY); render(null); } };
   }
   function mount() {
     if ($id('bgta-launch')) return;
@@ -537,7 +708,7 @@
     document.head.append(style);
     const button = document.createElement('button');
     button.id = 'bgta-launch';
-    button.textContent = '赛事助手';
+    button.textContent = '赛事助手 v' + SCRIPT_VERSION;
     button.onclick = () => {
       const panel = $id('bgta-panel');
       if (panel) panel.remove();
@@ -547,6 +718,15 @@
   }
   installHooks();
   mount();
+  migrationPromise = migrateLargeState().then(() => {
+    const panel = $id('bgta-panel');
+    if (panel) { render(load()); tell('旧记录检查/迁移完成，可以继续比赛。'); }
+  }).catch(error => {
+    migrationError = error;
+    console.error('BetaGomoku 旧记录迁移失败', error);
+    const panel = $id('bgta-panel');
+    if (panel) { render(load()); tell('旧记录迁移失败，已禁止启动比赛：' + (error.message || error), true); }
+  });
   window.addEventListener('beforeunload', event => {
     if (!active) return;
     event.preventDefault();
