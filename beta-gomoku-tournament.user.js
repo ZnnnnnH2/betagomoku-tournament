@@ -1,51 +1,46 @@
 // ==UserScript==
-// @name         BetaGomoku 赛事助手
+// @name         BetaGomoku 赛事助手（真实 Start）
 // @namespace    ruc-gomoku-ta
-// @version      1.0.0
-// @description  在已登录的 BetaGomoku 页面生成并执行 20 人小组赛与淘汰赛；赛果保存于本机浏览器。
+// @version      2.0.0
+// @description  驱动网页真实 Start，保存本地完整赛果、计分板和棋谱。
 // @match        http://gomoku.ruc.rvalue.moe/*
+// @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
 /*
- * 安装方式见 README.md。脚本只调用当前已登录页面所使用的 /api/exec，
- * 不读取、不导出 Cookie；所有赛程和结果存储在此站点的 localStorage 中。
+ * 裁判边界：本脚本只操作 player0、player1、fastmode、start_button。
+ * 网页自身 game() 是唯一裁判：它执行选手、判禁手、画棋盘和写终局消息。
+ * 脚本只观察网页实际 draw_chess、api/exec 响应和终局消息，绝不重算胜负。
  */
 (() => {
   'use strict';
 
-  const STORE_KEY = 'ruc-gomoku-tournament-v1';
-  const SIZE = 15;
-  const EMPTY = -1;
-  const BLACK = 0;
-  const WHITE = 1;
-  const EXEC_RETRIES = 4;
-
-  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const byId = id => document.getElementById(id);
-  let runnerActive = false;
-  let stopAfterFixture = false;
-
-  class PlayerError extends Error {}
-  class ServiceError extends Error {}
-  const esc = value => String(value).replace(/[&<>'"]/g, char => ({
+  const KEY = 'ruc-betagomoku-real-start-v2';
+  const $id = id => document.getElementById(id);
+  const esc = value => String(value == null ? '' : value).replace(/[&<>'"]/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
-  })[char]);
+  })[c]);
+  let active = false;
+  let capture = null;
+  let fetchHooked = false;
+  let drawHooked = false;
 
-  function notify(message, error = false) {
-    const box = byId('bgta-status');
-    if (box) {
-      box.textContent = message;
-      box.style.color = error ? '#b42318' : '#175cd3';
-    }
+  function save(state) { localStorage.setItem(KEY, JSON.stringify(state)); }
+  function load() {
+    try { const raw = localStorage.getItem(KEY); return raw ? JSON.parse(raw) : null; }
+    catch (error) { console.error(error); return null; }
   }
-
-  function createRng(seed) {
+  function tell(message, error) {
+    const node = $id('bgta-status');
+    if (!node) return;
+    node.textContent = message;
+    node.style.color = error ? '#b42318' : '#175cd3';
+  }
+  function id(prefix) { return prefix + '-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8); }
+  function rng(seed) {
     let state = 2166136261;
-    for (const char of String(seed)) {
-      state ^= char.charCodeAt(0);
-      state = Math.imul(state, 16777619);
-    }
+    for (const c of String(seed)) { state ^= c.charCodeAt(0); state = Math.imul(state, 16777619); }
     return () => {
       state += 0x6D2B79F5;
       let value = state;
@@ -54,514 +49,358 @@
       return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
     };
   }
-
-  function shuffled(items, rng) {
-    const result = [...items];
-    for (let index = result.length - 1; index > 0; index -= 1) {
-      const swap = Math.floor(rng() * (index + 1));
-      [result[index], result[swap]] = [result[swap], result[index]];
+  function shuffle(items, random) {
+    const out = items.slice();
+    for (let i = out.length - 1; i > 0; i -= 1) {
+      const j = Math.floor(random() * (i + 1));
+      [out[i], out[j]] = [out[j], out[i]];
     }
-    return result;
+    return out;
   }
-
-  function nowId(prefix) {
-    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  }
-
   function parseRoster(text) {
-    const seen = new Set();
-    const people = [];
-    for (const raw of text.split(/[\n,;，；\t ]+/)) {
-      const uid = raw.trim();
-      if (!uid) continue;
-      if (!/^\d{6,}$/.test(uid)) throw new Error(`“${uid}”不是有效学号。`);
-      if (seen.has(uid)) throw new Error(`学号 ${uid} 重复。`);
-      seen.add(uid);
-      people.push({ uid, name: uid, tie: 0 });
-    }
-    if (people.length !== 20) throw new Error(`需要恰好 20 个学号，当前为 ${people.length} 个。`);
-    const available = new Set([...document.querySelectorAll('#player0 option')].map(option => option.value));
-    const missing = people.map(person => person.uid).filter(uid => !available.has(uid));
-    if (missing.length) throw new Error(`当前页面没有以下学号的已提交程序：${missing.join('、')}`);
-    return people;
+    const roster = text.split(/[\s,;，；]+/).filter(Boolean);
+    if (roster.length !== 20) throw new Error('需要恰好 20 个学号，当前为 ' + roster.length + ' 个。');
+    if (roster.some(uid => !/^\d{6,}$/.test(uid))) throw new Error('名单中存在不是学号的内容。');
+    if (new Set(roster).size !== 20) throw new Error('名单中存在重复学号。');
+    const available = new Set([...document.querySelectorAll('#player0 option')].map(item => item.value).filter(Boolean));
+    const missing = roster.filter(uid => !available.has(uid));
+    if (missing.length) throw new Error('网页当前没有以下学号的提交：' + missing.join('、'));
+    return roster;
   }
-
-  function initialState(roster, seed) {
-    const rng = createRng(seed);
-    const people = shuffled(roster, rng).map(person => ({ ...person, tie: rng() }));
-    const groups = ['A', 'B', 'C', 'D', 'E'].map((name, index) => ({
-      name,
-      people: people.slice(index * 4, index * 4 + 4).map(person => person.uid)
-    }));
-    const personByUid = Object.fromEntries(people.map(person => [person.uid, person]));
-    const fixtures = [];
-    for (const group of groups) {
-      for (let i = 0; i < group.people.length; i += 1) {
-        for (let j = i + 1; j < group.people.length; j += 1) {
-          fixtures.push({
-            id: nowId(`group-${group.name}`), phase: 'group', group: group.name,
-            players: [group.people[i], group.people[j]], status: 'pending', games: []
-          });
-        }
+  function createState(roster, seed) {
+    const random = rng(seed);
+    const people = shuffle(roster, random);
+    const ties = Object.fromEntries(people.map(uid => [uid, random()]));
+    const groups = ['A', 'B', 'C', 'D', 'E'].map((name, n) => ({ name, people: people.slice(n * 4, n * 4 + 4) }));
+    const groupFixtures = [];
+    groups.forEach(group => {
+      for (let left = 0; left < 4; left += 1) for (let right = left + 1; right < 4; right += 1) {
+        groupFixtures.push({
+          id: id('group-' + group.name), phase: 'group', group: group.name, round: '小组 ' + group.name,
+          players: [group.people[left], group.people[right]], games: [], status: 'pending'
+        });
       }
-    }
+    });
     return {
-      version: 1, seed, createdAt: new Date().toISOString(), personByUid, groups,
-      groupFixtures: fixtures, knockout: null, log: []
+      format: 'beta-gomoku-page-record-2.0', createdAt: new Date().toISOString(), seed, roster: people,
+      ties, groups, groupFixtures, knockout: null, events: [], waiting: null, settings: { autoDownload: true }
     };
   }
 
-  function loadState() {
-    try {
-      const raw = localStorage.getItem(STORE_KEY);
-      return raw ? JSON.parse(raw) : null;
-    } catch (error) {
-      console.error(error);
-      return null;
-    }
-  }
-
-  function saveState(state) {
-    localStorage.setItem(STORE_KEY, JSON.stringify(state));
-  }
-
-  function clearState() {
-    localStorage.removeItem(STORE_KEY);
-  }
-
-  function emptyBoard() {
-    return Array.from({ length: SIZE }, () => Array(SIZE).fill(EMPTY));
-  }
-
-  function exactFive(board) {
-    for (let row = 0; row < SIZE; row += 1) {
-      for (let col = 0; col < SIZE; col += 1) {
-        const stone = board[row][col];
-        if (stone === EMPTY) continue;
-        for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]]) {
-          const endRow = row + dr * 4;
-          const endCol = col + dc * 4;
-          if (endRow < 0 || endRow >= SIZE || endCol < 0 || endCol >= SIZE) continue;
-          let valid = true;
-          for (let step = 1; step < 5; step += 1) {
-            if (board[row + dr * step][col + dc * step] !== stone) {
-              valid = false;
-              break;
-            }
-          }
-          if (!valid) continue;
-          const afterRow = row + dr * 5;
-          const afterCol = col + dc * 5;
-          const beforeRow = row - dr;
-          const beforeCol = col - dc;
-          const extendsAfter = afterRow >= 0 && afterRow < SIZE && afterCol >= 0 && afterCol < SIZE && board[afterRow][afterCol] === stone;
-          const extendsBefore = beforeRow >= 0 && beforeRow < SIZE && beforeCol >= 0 && beforeCol < SIZE && board[beforeRow][beforeCol] === stone;
-          if (!extendsAfter && !extendsBefore) return stone;
-        }
-      }
-    }
-    return EMPTY;
-  }
-
-  // 与网站当前 judgeLongBan 完全同义：pos 尚未写入棋盘，len 从新落子计为 1。
-  function longBan(board, row, col) {
-    for (const [dr, dc] of [[1, 0], [0, 1], [1, 1], [1, -1]]) {
-      let length = 1;
-      for (let r = row - dr, c = col - dc; r >= 0 && r < SIZE && c >= 0 && c < SIZE && board[r][c] === BLACK; r -= dr, c -= dc) length += 1;
-      for (let r = row + dr, c = col + dc; r >= 0 && r < SIZE && c >= 0 && c < SIZE && board[r][c] === BLACK; r += dr, c += dc) length += 1;
-      if (length > 5) return true;
-    }
-    return false;
-  }
-
-  // 复制平台的“四四”计数，不额外添加平台没有实现的三三禁手。
-  function fourOnLine(board, row, col, dr, dc) {
-    let before = 0;
-    let middle = 1;
-    let after = 0;
-    let gap = false;
-    for (let r = row - dr, c = col - dc; ; r -= dr, c -= dc) {
-      if (r < 0 || r >= SIZE || c < 0 || c >= SIZE || board[r][c] === WHITE) {
-        if (!gap) before = -1;
-        break;
-      }
-      if (board[r][c] === BLACK) {
-        if (gap) before += 1; else middle += 1;
-      } else {
-        if (gap) break;
-        gap = true;
-      }
-    }
-    gap = false;
-    for (let r = row + dr, c = col + dc; ; r += dr, c += dc) {
-      if (r < 0 || r >= SIZE || c < 0 || c >= SIZE || board[r][c] === WHITE) {
-        if (!gap) after = -1;
-        break;
-      }
-      if (board[r][c] === BLACK) {
-        if (gap) after += 1; else middle += 1;
-      } else {
-        if (gap) break;
-        gap = true;
-      }
-    }
-    if (middle === 4) return before === 0 || after === 0 ? 1 : 0;
-    return (before > 0 && before + middle === 4 ? 1 : 0) + (after > 0 && middle + after === 4 ? 1 : 0);
-  }
-
-  function fourFourBan(board, row, col) {
-    return [[1, 0], [0, 1], [-1, 1], [1, 1]]
-      .reduce((count, [dr, dc]) => count + fourOnLine(board, row, col, dr, dc), 0) > 1;
-  }
-
-  function makeInput(board, color) {
-    return `${color}\n${board.map(row => row.join(' ')).join('\n')}\n`;
-  }
-
-  async function moveFor(uid, board, color) {
-    for (let attempt = 1; attempt <= EXEC_RETRIES; attempt += 1) {
-      try {
-        const response = await fetch('/api/exec', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uid, input: makeInput(board, color) })
-        });
-        if (!response.ok) {
-          throw new ServiceError(`平台请求失败（HTTP ${response.status}）`);
-        }
-        let data;
-        try { data = await response.json(); }
-        catch { throw new ServiceError('平台返回了无法解析的响应'); }
-        if (data?.result?.status !== 1) {
-          const names = ['Unknown', 'OK', 'Time Limit Exceeded', 'Memory Limit Exceeded', 'Runtime Error', 'Cancelled', 'Output Limit Exceeded'];
-          throw new PlayerError(names[data?.result?.status] || `执行状态 ${data?.result?.status}`);
-        }
-        const parts = String(data.output || '').trim().split(/\s+/).map(Number);
-        if (parts.length !== 2 || !parts.every(Number.isInteger)) throw new PlayerError('Invalid output');
-        return parts;
-      } catch (error) {
-        if (error instanceof PlayerError) throw error;
-        const serviceError = error instanceof ServiceError ? error : new ServiceError(`网络连接失败：${error.message || error}`);
-        if (attempt === EXEC_RETRIES) throw serviceError;
-        const waitSeconds = 2 ** (attempt - 1);
-        notify(`平台暂时不可用，${waitSeconds} 秒后重试（${attempt}/${EXEC_RETRIES}）；本局不会记分。`, true);
-        await sleep(waitSeconds * 1000);
-      }
-    }
-  }
-
-  async function playGame(blackUid, whiteUid, onMove) {
-    const board = emptyBoard();
-    let next = BLACK;
-    let moves = 0;
-    let winner = EMPTY;
-    let reason = 'draw';
-    while ((winner = exactFive(board)) === EMPTY) {
-      if (moves === 225) return { black: blackUid, white: whiteUid, winner: 'draw', moves, reason: 'draw' };
-      const uid = next === BLACK ? blackUid : whiteUid;
-      try {
-        const [row, col] = await moveFor(uid, board, next);
-        if (row < 0 || row >= SIZE || col < 0 || col >= SIZE) throw new Error('Move outside board');
-        if (board[row][col] !== EMPTY) throw new Error('Tried to put on another chess piece');
-        if (next === BLACK && longBan(board, row, col)) throw new Error('LongBan');
-        if (next === BLACK && fourFourBan(board, row, col)) throw new Error('FourFourBan');
-        board[row][col] = next;
-        moves += 1;
-        if (onMove && (moves % 10 === 0 || moves === 1)) onMove(moves, blackUid, whiteUid);
-      } catch (error) {
-        // 接口/网络故障不能误判为学生输棋；上层会保留已完成局并停止批量任务。
-        if (error instanceof ServiceError) throw error;
-        winner = next ^ 1;
-        reason = `Player #${next} FATAL ERROR: ${error.message || error}`;
-        return { black: blackUid, white: whiteUid, winner: winner === BLACK ? 'black' : 'white', moves, reason };
-      }
-      next ^= 1;
-    }
-    return { black: blackUid, white: whiteUid, winner: winner === BLACK ? 'black' : 'white', moves, reason: 'five' };
-  }
-
-  function scoreWinner(game) {
-    return game.winner === 'black' ? game.black : game.white; // 规则：平局计白胜
-  }
-
-  async function runFixture(state, fixture) {
-    fixture.status = 'running';
-    saveState(state);
-    const [first, second] = fixture.players;
-    const games = [[first, second], [second, first]];
-    for (let index = fixture.games.length; index < games.length; index += 1) {
-      const [black, white] = games[index];
-      notify(`${fixture.phase === 'group' ? `小组 ${fixture.group}` : fixture.round}：${black} 执黑 vs ${white} 执白，第 ${index + 1}/2 局`);
-      const game = await playGame(black, white, moves => notify(`${fixture.phase === 'group' ? `小组 ${fixture.group}` : fixture.round}：${black} vs ${white}，第 ${index + 1}/2 局，已 ${moves} 手`));
-      fixture.games.push({ ...game, at: new Date().toISOString() });
-      state.log.push({ type: 'game', fixture: fixture.id, game });
-      saveState(state);
-      await sleep(100); // 只在两局之间让出事件循环，不并发压测平台。
-    }
-    fixture.status = 'done';
-    saveState(state);
-  }
-
-  function groupStats(state, group) {
-    const stats = Object.fromEntries(group.people.map(uid => [uid, { uid, wins: 0, whiteWins: 0, blackWinMoves: [] }]));
-    for (const fixture of state.groupFixtures.filter(item => item.group === group.name && item.status === 'done')) {
-      for (const game of fixture.games) {
-        const winner = scoreWinner(game);
-        stats[winner].wins += 1;
-        if (winner === game.white) stats[winner].whiteWins += 1;
-        if (winner === game.black) stats[winner].blackWinMoves.push(game.moves);
-      }
-    }
-    return Object.values(stats).map(item => ({
-      ...item,
-      blackAverage: item.blackWinMoves.length ? item.blackWinMoves.reduce((a, b) => a + b, 0) / item.blackWinMoves.length : null,
-      tie: state.personByUid[item.uid].tie
+  function scored(game) { return game.winner === 'black' ? game.black : game.white; }
+  function groupRows(state, group) {
+    const rows = Object.fromEntries(group.people.map(uid => [uid, { uid, wins: 0, whiteWins: 0, blackMoves: [], tie: state.ties[uid] }]));
+    state.groupFixtures.filter(item => item.group === group.name && item.status === 'done').forEach(fixture => {
+      fixture.games.forEach(game => {
+        const winner = scored(game);
+        rows[winner].wins += 1;
+        if (winner === game.white) rows[winner].whiteWins += 1;
+        if (winner === game.black) rows[winner].blackMoves.push(game.moves);
+      });
+    });
+    return Object.values(rows).map(row => Object.assign(row, {
+      blackAverage: row.blackMoves.length ? row.blackMoves.reduce((a, b) => a + b, 0) / row.blackMoves.length : null
     }));
   }
-
-  function rankStats(rows) {
-    return [...rows].sort((a, b) =>
-      b.wins - a.wins || b.whiteWins - a.whiteWins ||
-      (a.blackAverage ?? Infinity) - (b.blackAverage ?? Infinity) || a.tie - b.tie
-    );
+  function rank(rows) {
+    return rows.slice().sort((a, b) => b.wins - a.wins || b.whiteWins - a.whiteWins ||
+      (a.blackAverage == null ? Infinity : a.blackAverage) - (b.blackAverage == null ? Infinity : b.blackAverage) || a.tie - b.tie);
   }
-
-  function allGroupsDone(state) {
-    return state.groupFixtures.every(fixture => fixture.status === 'done');
-  }
-
-  function makePairings(entries, rng) {
-    const shuffledEntries = shuffled(entries, rng);
+  function groupsDone(state) { return state.groupFixtures.every(item => item.status === 'done'); }
+  function pairGroups(entries, random) {
     const pairs = [];
-    function search(remaining) {
-      if (!remaining.length) return true;
-      const first = remaining[0];
-      const candidates = shuffled(remaining.slice(1), rng);
-      for (const second of candidates) {
+    function search(rest) {
+      if (!rest.length) return true;
+      const first = rest[0];
+      for (const second of shuffle(rest.slice(1), random)) {
         if (first.group === second.group) continue;
-        const rest = remaining.filter(entry => entry !== first && entry !== second);
         pairs.push([first, second]);
-        if (search(rest)) return true;
+        if (search(rest.filter(item => item !== first && item !== second))) return true;
         pairs.pop();
       }
       return false;
     }
-    if (!search(shuffledEntries)) throw new Error('无法满足八强首轮同组回避；请检查晋级名单。');
+    if (!search(shuffle(entries, random))) throw new Error('无法构造同组回避的八强签表。');
     return pairs;
   }
-
   function prepareKnockout(state) {
-    if (!allGroupsDone(state)) throw new Error('小组赛尚未全部完成。');
-    if (state.knockout) return;
-    const rankedGroups = state.groups.map(group => ({ group, ranked: rankStats(groupStats(state, group)) }));
-    const entrants = rankedGroups.map(({ group, ranked }) => ({ uid: ranked[0].uid, group: group.name }));
-    const seconds = rankStats(rankedGroups.map(({ group, ranked }) => ({ ...ranked[1], group: group.name }))).slice(0, 3);
-    entrants.push(...seconds.map(row => ({ uid: row.uid, group: row.group })));
-    const rng = createRng(`${state.seed}:knockout`);
-    const pairs = makePairings(entrants, rng);
+    if (state.knockout || !groupsDone(state)) return;
+    const ranks = state.groups.map(group => ({ group, rows: rank(groupRows(state, group)) }));
+    const entrants = ranks.map(item => ({ uid: item.rows[0].uid, group: item.group.name }));
+    rank(ranks.map(item => Object.assign({}, item.rows[1], { group: item.group.name }))).slice(0, 3)
+      .forEach(item => entrants.push({ uid: item.uid, group: item.group }));
     state.knockout = {
-      entrants, rounds: [[...pairs].map((pair, index) => ({
-        id: nowId('qf'), phase: 'knockout', round: `八强第 ${index + 1} 场`, players: pair.map(item => item.uid),
-        groups: pair.map(item => item.group), status: 'pending', games: [], winner: null
-      }))], champion: null
+      entrants, champion: null,
+      rounds: [pairGroups(entrants, rng(state.seed + ':knockout')).map((pair, n) => ({
+        id: id('qf'), phase: 'knockout', round: '八强第 ' + (n + 1) + ' 场',
+        players: pair.map(item => item.uid), groups: pair.map(item => item.group),
+        games: [], status: 'pending', winner: null, winnerBasis: null
+      }))]
     };
-    saveState(state);
+    state.events.push({ type: 'knockout_draw', at: new Date().toISOString(), entrants });
+    save(state);
   }
-
-  function knockoutWinner(state, fixture) {
-    const [one, two] = fixture.games;
-    const oneWinner = scoreWinner(one);
-    const twoWinner = scoreWinner(two);
-    if (oneWinner === twoWinner) return oneWinner;
-    const rng = createRng(`${state.seed}:${fixture.id}`);
-    const bothBlack = oneWinner === one.black && twoWinner === two.black;
-    if (bothBlack) {
-      if (one.moves !== two.moves) return one.moves < two.moves ? oneWinner : twoWinner;
-      return rng() < 0.5 ? oneWinner : twoWinner;
+  function knockoutDecision(state, fixture) {
+    const [first, second] = fixture.games;
+    const a = scored(first), b = scored(second);
+    if (a === b) return [a, '两局计分胜者一致'];
+    const random = rng(state.seed + ':' + fixture.id);
+    if (a === first.black && b === second.black) {
+      if (first.moves !== second.moves) return [first.moves < second.moves ? a : b, '黑棋获胜手数更少'];
+      return [random() < 0.5 ? a : b, '黑棋获胜手数相同，稳定抽签'];
     }
-    // 只能是双方各以白方得分；白棋实际取胜优先于平局计白胜。
-    const oneActual = one.winner === 'white';
-    const twoActual = two.winner === 'white';
-    if (oneActual !== twoActual) return oneActual ? oneWinner : twoWinner;
-    if (oneActual && one.moves !== two.moves) return one.moves < two.moves ? oneWinner : twoWinner;
-    return rng() < 0.5 ? oneWinner : twoWinner;
+    const firstActual = first.winner === 'white', secondActual = second.winner === 'white';
+    if (firstActual !== secondActual) return [firstActual ? a : b, '白棋实际取胜优先于平局计白胜'];
+    if (firstActual && first.moves !== second.moves) return [first.moves < second.moves ? a : b, '白棋获胜手数更少'];
+    return [random() < 0.5 ? a : b, '规则指标相同，稳定抽签'];
   }
-
-  function advanceRound(state) {
-    const rounds = state.knockout.rounds;
-    const current = rounds.at(-1);
-    if (!current.every(fixture => fixture.status === 'done')) return;
-    const winners = current.map(fixture => fixture.winner);
-    if (winners.length === 1) {
-      state.knockout.champion = winners[0];
-      return;
-    }
+  function advance(state) {
+    const current = state.knockout.rounds.at(-1);
+    if (!current.every(item => item.status === 'done')) return;
+    const winners = current.map(item => item.winner);
+    if (winners.length === 1) { state.knockout.champion = winners[0]; return; }
     const label = winners.length === 4 ? '半决赛' : '决赛';
-    rounds.push(Array.from({ length: winners.length / 2 }, (_, index) => ({
-      id: nowId(`ko-${winners.length / 2}`), phase: 'knockout', round: `${label}第 ${index + 1} 场`,
-      players: [winners[index * 2], winners[index * 2 + 1]], groups: [], status: 'pending', games: [], winner: null
+    state.knockout.rounds.push(Array.from({ length: winners.length / 2 }, (_, n) => ({
+      id: id(winners.length === 4 ? 'sf' : 'final'), phase: 'knockout', round: label + '第 ' + (n + 1) + ' 场',
+      players: [winners[n * 2], winners[n * 2 + 1]], groups: [], games: [], status: 'pending', winner: null, winnerBasis: null
     })));
   }
-
-  async function runNext(state) {
-    const groupFixture = state.groupFixtures.find(fixture => fixture.status !== 'done');
-    if (groupFixture) {
-      await runFixture(state, groupFixture);
-      return;
-    }
+  function nextFixture(state) {
+    const group = state.groupFixtures.find(item => item.status !== 'done');
+    if (group) return group;
     prepareKnockout(state);
-    const current = state.knockout.rounds.at(-1);
-    const fixture = current.find(item => item.status !== 'done');
-    if (!fixture) return;
-    await runFixture(state, fixture);
-    fixture.winner = knockoutWinner(state, fixture);
-    state.log.push({ type: 'advance', fixture: fixture.id, winner: fixture.winner });
-    advanceRound(state);
-    saveState(state);
+    if (state.knockout.champion) return null;
+    const fixture = state.knockout.rounds.at(-1).find(item => item.status !== 'done');
+    if (fixture) return fixture;
+    advance(state);
+    return nextFixture(state);
   }
 
-  async function withRunner(state, action) {
-    if (runnerActive) throw new Error('已有赛事任务在执行，请勿重复点击。');
-    runnerActive = true;
+  function installHooks() {
+    if (!fetchHooked) {
+      fetchHooked = true;
+      const originalFetch = window.fetch.bind(window);
+      window.fetch = async (...args) => {
+        try {
+          const response = await originalFetch(...args);
+          if (capture && String(args[0]).includes('/api/exec')) {
+            let payload = {}, responseBody = null;
+            try { payload = JSON.parse((args[1] || {}).body || '{}'); } catch (_) {}
+            try { responseBody = await response.clone().json(); } catch (_) {}
+            capture.executions.push({
+              at: new Date().toISOString(), uid: payload.uid || null, input: payload.input || null,
+              color: Number(String(payload.input || '').split('\n')[0]), response: responseBody
+            });
+          }
+          return response;
+        } catch (error) {
+          if (capture && String(args[0]).includes('/api/exec')) capture.executions.push({ at: new Date().toISOString(), transportError: String(error) });
+          throw error;
+        }
+      };
+    }
+    if (!drawHooked && typeof window.draw_chess === 'function') {
+      const originalDraw = window.draw_chess;
+      const wrappedDraw = function () {
+        const [row, col, color] = arguments;
+        if (capture) capture.history.push({
+          ply: capture.history.length + 1, row, col, color: color === 0 ? 'black' : 'white',
+          uid: color === 0 ? capture.black : capture.white
+        });
+        return originalDraw.apply(this, arguments);
+      };
+      wrappedDraw.__bgtaWrapped = true;
+      window.draw_chess = wrappedDraw;
+      drawHooked = true;
+    }
+  }
+  function setPlayer(selector, uid) {
+    const select = $id(selector);
+    if (!select) throw new Error('网页缺少 #' + selector + '。');
+    select.value = uid;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    if (window.$) window.$(select).change();
+  }
+  function setFastMode() {
+    if (window.$) window.$('#fastmode').checkbox('set checked');
+    else $id('fastmode')?.querySelector('input')?.click();
+  }
+  function outcome(message) {
+    const text = message.innerText.replace(/\s+/g, ' ').trim();
+    if (message.classList.contains('success')) {
+      if (/Draw\./i.test(text)) return { winner: 'draw', reason: '网页 Game Over：Draw.', pageMessage: text };
+      const match = text.match(/Player #([01]) \(([^)]+)\) won\./i);
+      if (!match) throw new Error('无法解析网页终局消息：' + text);
+      return { winner: match[1] === '0' ? 'black' : 'white', reason: '网页 Game Over：' + match[0], pageMessage: text };
+    }
+    const fault = text.match(/Player #([01]) FATAL ERROR:?\s*(.*)/i);
+    if (!fault) throw new Error('无法解析网页错误消息：' + text);
+    return { winner: fault[1] === '0' ? 'white' : 'black', reason: '网页 ' + text, pageMessage: text };
+  }
+  function waitForEnd(previousMessages) {
+    return new Promise((resolve, reject) => {
+      const deadline = Date.now() + 16 * 60 * 1000;
+      const timer = setInterval(() => {
+        const message = [...document.querySelectorAll('.ui.message')].find(node =>
+          !previousMessages.has(node) && (node.classList.contains('success') || node.classList.contains('negative')));
+        if (message && !$id('start_button').classList.contains('disabled')) {
+          clearInterval(timer);
+          try { resolve(outcome(message)); } catch (error) { reject(error); }
+        } else if (Date.now() > deadline) {
+          clearInterval(timer);
+          reject(new Error('网页 16 分钟内没有返回终局结果；本局未记分。'));
+        }
+      }, 100);
+    });
+  }
+  async function realGame(black, white) {
+    installHooks();
+    if (!$id('start_button')) throw new Error('请先进入 BetaGomoku 主页面。');
+    if (!drawHooked) throw new Error('未能挂接网页的落子函数；为保证棋谱完整，本局没有启动。请刷新页面后重试。');
+    setPlayer('player0', black);
+    setPlayer('player1', white);
+    setFastMode();
+    const previousMessages = new Set(document.querySelectorAll('.ui.message'));
+    capture = { black, white, history: [], executions: [] };
     try {
-      await action();
+      $id('start_button').click();
+      const result = await waitForEnd(previousMessages);
+      return {
+        black, white, winner: result.winner, moves: capture.history.length, history: capture.history,
+        executions: capture.executions, reason: result.reason, pageMessage: result.pageMessage, finishedAt: new Date().toISOString()
+      };
     } finally {
-      runnerActive = false;
-      render(state);
+      capture = null;
     }
   }
 
-  function nextLabel(state) {
-    const group = state.groupFixtures.find(fixture => fixture.status !== 'done');
-    if (group) return `下一场：小组 ${group.group}，${group.players[0]} vs ${group.players[1]}`;
-    if (!state.knockout) return '小组赛已结束，可生成八强签表。';
-    if (state.knockout.champion) return `冠军：${state.knockout.champion}`;
-    const fixture = state.knockout.rounds.at(-1).find(item => item.status !== 'done');
-    return fixture ? `下一场：${fixture.round}，${fixture.players[0]} vs ${fixture.players[1]}` : '正在生成下一轮。';
-  }
-
-  function download(name, type, text) {
-    const blob = new Blob([text], { type });
+  function fixtures(state) { return state.groupFixtures.concat(state.knockout ? state.knockout.rounds.flat() : []); }
+  function download(name, mime, text) {
+    const blob = new Blob([text], { type: mime });
     const link = document.createElement('a');
     link.href = URL.createObjectURL(blob);
     link.download = name;
     link.click();
-    URL.revokeObjectURL(link.href);
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
   }
-
-  function csv(state) {
-    const rows = [['阶段', '分组或轮次', '黑方', '白方', '实际结果', '规则计分胜者', '总手数', '结束原因']];
-    for (const fixture of [...state.groupFixtures, ...(state.knockout?.rounds.flat() || [])]) {
-      for (const game of fixture.games) rows.push([
-        fixture.phase, fixture.group || fixture.round, game.black, game.white, game.winner,
-        scoreWinner(game), game.moves, game.reason
-      ]);
+  function record(state, fixture, game, number) {
+    return {
+      format: 'beta-gomoku-page-record-1.0', tournament: { createdAt: state.createdAt, seed: state.seed },
+      fixture: { id: fixture.id, phase: fixture.phase, groupOrRound: fixture.group || fixture.round, players: fixture.players, game: number },
+      game
+    };
+  }
+  function toCsv(state) {
+    const rows = [['fixture', 'phase', 'group_or_round', 'game', 'black', 'white', 'raw_result', 'scored_winner', 'moves', 'reason', 'finished_at']];
+    fixtures(state).forEach(fixture => fixture.games.forEach((game, n) => rows.push([
+      fixture.id, fixture.phase, fixture.group || fixture.round, n + 1, game.black, game.white, game.winner,
+      scored(game), game.moves, game.reason, game.finishedAt
+    ])));
+    return rows.map(row => row.map(value => '"' + String(value == null ? '' : value).replaceAll('"', '""') + '"').join(',')).join('\n');
+  }
+  async function runOne(state) {
+    if (active) return;
+    const fixture = nextFixture(state);
+    if (!fixture) { render(state); tell('赛事已结束，冠军：' + state.knockout.champion); return; }
+    const number = fixture.games.length + 1;
+    const [first, second] = fixture.players;
+    const [black, white] = number === 1 ? [first, second] : [second, first];
+    fixture.status = 'running';
+    state.waiting = null;
+    state.events.push({ type: 'game_started', at: new Date().toISOString(), fixture: fixture.id, game: number, black, white });
+    save(state);
+    active = true;
+    render(state);
+    tell(fixture.round + ' 第 ' + number + '/2 局：' + black + ' 黑 vs ' + white + ' 白；正在运行网页 Start。');
+    try {
+      const game = await realGame(black, white);
+      fixture.games.push(game);
+      if (fixture.games.length === 2) {
+        fixture.status = 'done';
+        if (fixture.phase === 'knockout') {
+          [fixture.winner, fixture.winnerBasis] = knockoutDecision(state, fixture);
+          advance(state);
+        }
+      }
+      state.waiting = { fixture: fixture.id, game: number, at: game.finishedAt, message: fixture.round + ' 第 ' + number + ' 局已结束；点击“开始下一局”继续。' };
+      state.events.push({ type: 'game_finished', at: game.finishedAt, fixture: fixture.id, game: number, result: game });
+      save(state);
+      if (state.settings.autoDownload) download('betagomoku-' + fixture.id + '-game-' + number + '.json', 'application/json;charset=utf-8', JSON.stringify(record(state, fixture, game, number), null, 2));
+      render(state);
+      tell(state.waiting.message);
+    } catch (error) {
+      state.events.push({ type: 'game_aborted', at: new Date().toISOString(), fixture: fixture.id, game: number, error: String(error) });
+      save(state);
+      render(state);
+      tell('本局未记分：' + (error.message || error), true);
+    } finally {
+      active = false;
+      render(state);
     }
-    return rows.map(row => row.map(value => `"${String(value).replaceAll('"', '""')}"`).join(',')).join('\n');
   }
 
+  function groupHtml(state, group) {
+    const rows = rank(groupRows(state, group));
+    const order = Object.fromEntries(rows.slice().sort((a, b) => a.tie - b.tie).map((row, n) => [row.uid, n + 1]));
+    let html = '<section class="bgta-group"><h3>小组 ' + group.name + '</h3><table><thead><tr><th>排</th><th>学号</th><th>总胜</th><th>白胜</th><th>黑胜均手</th><th>抽签序</th></tr></thead><tbody>';
+    rows.forEach((row, n) => {
+      html += '<tr class="' + (n === 0 ? 'leader' : '') + '"><td>' + (n + 1) + '</td><td>' + esc(row.uid) + '</td><td>' + row.wins + '</td><td>' + row.whiteWins + '</td><td>' + (row.blackAverage == null ? '—' : row.blackAverage.toFixed(2)) + '</td><td>' + order[row.uid] + '</td></tr>';
+    });
+    return html + '</tbody></table><small>排序：总胜 → 白胜 → 黑棋获胜平均手数（少优先）→ 抽签序</small></section>';
+  }
+  function knockoutHtml(state) {
+    if (!state.knockout) return '';
+    let html = '<section class="bgta-knockout"><h3>淘汰赛</h3>';
+    state.knockout.rounds.flat().forEach(fixture => {
+      html += '<div class="bgta-fixture"><b>' + esc(fixture.round) + '：</b>' + esc(fixture.players[0]) + ' vs ' + esc(fixture.players[1]) + (fixture.winner ? '<strong>晋级 ' + esc(fixture.winner) + '</strong>' : '待赛');
+      fixture.games.forEach((game, n) => { html += '<small>第 ' + (n + 1) + ' 局：' + esc(game.black) + ' 黑 vs ' + esc(game.white) + ' 白；' + esc(game.winner) + '，计分 ' + esc(scored(game)) + '，' + game.moves + ' 手</small>'; });
+      if (fixture.winnerBasis) html += '<small>晋级依据：' + esc(fixture.winnerBasis) + '</small>';
+      html += '</div>';
+    });
+    return html + (state.knockout.champion ? '<p>冠军：<b>' + esc(state.knockout.champion) + '</b></p>' : '') + '</section>';
+  }
   function render(state) {
-    const panel = byId('bgta-panel');
+    const panel = $id('bgta-panel');
     if (!panel) return;
     if (!state) {
-      panel.innerHTML = `
-        <h2>BetaGomoku 赛事助手</h2>
-        <p>粘贴 20 个学号（空格、逗号或换行均可）。脚本会先检查每人是否已有可执行提交。</p>
-        <textarea id="bgta-roster" placeholder="2025200001\n2025200002\n..."></textarea>
-        <label>抽签种子 <input id="bgta-seed" value="${new Date().toISOString().slice(0, 10)}"></label>
-        <button id="bgta-create">随机分组并生成赛程</button>
-        <p id="bgta-status"></p>`;
-      byId('bgta-create').onclick = () => {
-        try {
-          const roster = parseRoster(byId('bgta-roster').value);
-          const next = initialState(roster, byId('bgta-seed').value.trim() || Date.now());
-          saveState(next);
-          render(next);
-        } catch (error) { notify(error.message, true); }
+      panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p>本版本只驱动网页真实 Start；网页是单局裁判。</p><textarea id="bgta-roster" placeholder="粘贴 20 个学号，每行一个"></textarea><label>抽签种子 <input id="bgta-seed" value="' + new Date().toISOString().slice(0, 10) + '"></label><button id="bgta-create">随机分组</button><p id="bgta-status"></p>';
+      $id('bgta-create').onclick = () => {
+        try { const state = createState(parseRoster($id('bgta-roster').value), $id('bgta-seed').value.trim() || Date.now()); save(state); render(state); tell('分组已保存。点击“开始下一局”启动首局。'); }
+        catch (error) { tell(error.message || String(error), true); }
       };
       return;
     }
-    const groupHtml = state.groups.map(group => {
-      const ranks = rankStats(groupStats(state, group));
-      return `<section><h3>组 ${group.name}</h3><ol>${ranks.map(row => `<li>${esc(row.uid)} — 总胜 ${row.wins}，白胜 ${row.whiteWins}，黑胜平均手数 ${row.blackAverage === null ? '—' : row.blackAverage.toFixed(1)}</li>`).join('')}</ol></section>`;
-    }).join('');
-    const done = state.groupFixtures.filter(item => item.status === 'done').length;
-    const knockout = state.knockout ? `<p>八强：${state.knockout.entrants.map(item => item.uid).join('、')}<br>${state.knockout.champion ? `冠军：<b>${state.knockout.champion}</b>` : ''}</p>` : '';
-    panel.innerHTML = `
-      <h2>BetaGomoku 赛事助手</h2>
-      <p><b>${esc(nextLabel(state))}</b></p>
-      <p>小组赛双局对阵：${done}/30；已完成单局：${state.groupFixtures.reduce((sum, item) => sum + item.games.length, 0)}/60。</p>
-      <div class="bgta-actions">
-        <button id="bgta-next">执行下一场双局</button>
-        <button id="bgta-all-group">连续执行剩余小组赛</button>
-        <button id="bgta-all">连续执行整届赛事</button>
-        <button id="bgta-pause">本场结束后暂停</button>
-        <button id="bgta-bracket">生成八强签表</button>
-        <button id="bgta-json">导出 JSON</button>
-        <button id="bgta-csv">导出 CSV</button>
-        <button id="bgta-reset">清除本机赛事</button>
-      </div>
-      <p id="bgta-status"></p>${knockout}<div class="bgta-groups">${groupHtml}</div>`;
-    byId('bgta-next').onclick = async () => {
-      try {
-        await withRunner(state, async () => { await runNext(state); notify('本场已保存。'); });
-      } catch (error) { saveState(state); render(state); notify(error.message || String(error), true); }
-    };
-    byId('bgta-all-group').onclick = async () => {
-      try {
-        stopAfterFixture = false;
-        await withRunner(state, async () => {
-          while (state.groupFixtures.some(fixture => fixture.status !== 'done') && !stopAfterFixture) await runNext(state);
-          notify(stopAfterFixture ? '已在本场结束后暂停。' : '小组赛全部完成。');
-        });
-      } catch (error) { saveState(state); render(state); notify(`已停止，当前未完成局不会记分：${error.message || error}`, true); }
-    };
-    byId('bgta-all').onclick = async () => {
-      try {
-        stopAfterFixture = false;
-        await withRunner(state, async () => {
-          while (!state.knockout?.champion && !stopAfterFixture) await runNext(state);
-          notify(stopAfterFixture ? '已在本场结束后暂停。' : `赛事完成，冠军：${state.knockout.champion}`);
-        });
-      } catch (error) { saveState(state); render(state); notify(`已停止，当前未完成局不会记分：${error.message || error}`, true); }
-    };
-    byId('bgta-pause').onclick = () => {
-      if (!runnerActive) { notify('当前没有连续执行任务。'); return; }
-      stopAfterFixture = true;
-      notify('将在当前双局对阵结束后暂停。');
-    };
-    byId('bgta-bracket').onclick = () => {
-      try { prepareKnockout(state); render(state); notify('八强签表已生成。'); }
-      catch (error) { notify(error.message, true); }
-    };
-    byId('bgta-json').onclick = () => download('gomoku-tournament.json', 'application/json', JSON.stringify(state, null, 2));
-    byId('bgta-csv').onclick = () => download('gomoku-games.csv', 'text/csv;charset=utf-8', `\uFEFF${csv(state)}`);
-    byId('bgta-reset').onclick = () => {
-      if (confirm('仅清除本机浏览器保存的赛程和赛果，确定吗？')) { clearState(); render(null); }
-    };
+    const groupGames = state.groupFixtures.reduce((sum, item) => sum + item.games.length, 0);
+    const totalGames = fixtures(state).reduce((sum, item) => sum + item.games.length, 0);
+    const waiting = state.waiting ? state.waiting.message : (active ? '网页正在执行当前局…' : '准备开始下一局。');
+    panel.innerHTML = '<h2>BetaGomoku 赛事助手</h2><p class="bgta-waiting">' + esc(waiting) + '</p><p>小组赛 ' + groupGames + '/60 局；全赛事 ' + totalGames + '/74 局。</p><div class="bgta-actions"><button id="bgta-next" ' + (active ? 'disabled' : '') + '>开始下一局</button><button id="bgta-json">导出完整 JSON</button><button id="bgta-csv">导出 CSV</button><button id="bgta-bracket">生成八强签表</button><button id="bgta-reset">清除本机赛事</button></div><label class="bgta-check"><input id="bgta-auto" type="checkbox" ' + (state.settings.autoDownload ? 'checked' : '') + '> 每局结束自动下载完整 JSON 记录</label><p id="bgta-status"></p><div class="bgta-groups">' + state.groups.map(group => groupHtml(state, group)).join('') + '</div>' + knockoutHtml(state);
+    $id('bgta-next').onclick = () => runOne(state);
+    $id('bgta-json').onclick = () => download('betagomoku-tournament.json', 'application/json;charset=utf-8', JSON.stringify(state, null, 2));
+    $id('bgta-csv').onclick = () => download('betagomoku-games.csv', 'text/csv;charset=utf-8', '\uFEFF' + toCsv(state));
+    $id('bgta-auto').onchange = event => { state.settings.autoDownload = event.target.checked; save(state); };
+    $id('bgta-bracket').onclick = () => { try { prepareKnockout(state); render(state); tell('八强签表已生成。'); } catch (error) { tell(error.message || String(error), true); } };
+    $id('bgta-reset').onclick = () => { if (confirm('仅清除本浏览器保存的赛程、赛果和名单，确定吗？')) { localStorage.removeItem(KEY); render(null); } };
   }
-
   function mount() {
-    if (byId('bgta-panel')) return;
+    if ($id('bgta-launch')) return;
     const style = document.createElement('style');
-    style.textContent = `
-      #bgta-launch { position: fixed; z-index: 10000; right: 20px; bottom: 20px; background:#175cd3; color:white; border:0; border-radius:999px; padding:12px 16px; cursor:pointer; box-shadow:0 3px 12px #0004; }
-      #bgta-panel { position:fixed; z-index:10001; right:20px; bottom:70px; width:min(520px,calc(100vw - 40px)); max-height:80vh; overflow:auto; box-sizing:border-box; padding:18px; border:1px solid #d0d5dd; border-radius:12px; background:#fff; box-shadow:0 8px 30px #0003; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-      #bgta-panel h2 { margin:0 0 10px; } #bgta-panel h3 { margin:12px 0 4px; } #bgta-panel textarea { width:100%; height:180px; box-sizing:border-box; margin:8px 0; } #bgta-panel button { margin:4px 6px 4px 0; padding:7px 10px; border:1px solid #98a2b3; border-radius:6px; background:#fff; cursor:pointer; } #bgta-panel #bgta-next, #bgta-panel #bgta-all-group { background:#175cd3; color:#fff; border-color:#175cd3; } #bgta-status { min-height:20px; } #bgta-panel ol { margin:3px 0; padding-left:22px; }`;
+    style.textContent = '#bgta-launch{position:fixed;z-index:10000;right:20px;bottom:20px;border:0;border-radius:999px;padding:12px 16px;background:#175cd3;color:#fff;font-weight:700;box-shadow:0 3px 12px #0005;cursor:pointer}#bgta-panel{position:fixed;z-index:10001;right:20px;top:60px;width:min(660px,calc(100vw - 40px));max-height:calc(100vh - 90px);overflow:auto;padding:18px;border:1px solid #d0d5dd;border-radius:12px;background:#fff;color:#182230;box-shadow:0 8px 30px #0004;font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}#bgta-panel h2{margin:0 0 8px}#bgta-panel h3{margin:12px 0 4px;color:#175cd3}#bgta-panel textarea{width:100%;height:160px;margin:8px 0;box-sizing:border-box}#bgta-panel button{margin:4px 6px 4px 0;padding:7px 10px;border:1px solid #98a2b3;border-radius:6px;background:#fff;cursor:pointer}#bgta-panel #bgta-next{background:#175cd3;color:#fff;border-color:#175cd3}#bgta-panel button:disabled{opacity:.55;cursor:wait}.bgta-waiting{font-weight:700}.bgta-check{display:block;margin:8px 0}.bgta-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.bgta-group{border:1px solid #e4e7ec;border-radius:8px;padding:7px}.bgta-group h3{margin-top:0}#bgta-panel table{width:100%;border-collapse:collapse;font-size:12px}#bgta-panel th,#bgta-panel td{padding:2px;text-align:right;border-top:1px solid #eef1f4}#bgta-panel th:first-child,#bgta-panel td:first-child,#bgta-panel th:nth-child(2),#bgta-panel td:nth-child(2){text-align:left}.leader{font-weight:700;color:#175cd3}.bgta-group small,.bgta-fixture small{display:block;color:#667085;font-size:11px}.bgta-knockout{margin-top:10px}.bgta-fixture{padding:6px 0;border-top:1px solid #e4e7ec}.bgta-fixture strong{float:right;color:#8a5a00}';
     document.head.append(style);
-    const launch = document.createElement('button');
-    launch.id = 'bgta-launch';
-    launch.textContent = '赛事助手';
-    launch.onclick = () => {
-      const panel = byId('bgta-panel');
-      if (panel) panel.remove(); else { const next = document.createElement('aside'); next.id = 'bgta-panel'; document.body.append(next); render(loadState()); }
+    const button = document.createElement('button');
+    button.id = 'bgta-launch';
+    button.textContent = '赛事助手';
+    button.onclick = () => {
+      const panel = $id('bgta-panel');
+      if (panel) panel.remove();
+      else { const next = document.createElement('aside'); next.id = 'bgta-panel'; document.body.append(next); render(load()); }
     };
-    document.body.append(launch);
+    document.body.append(button);
   }
-
+  installHooks();
   mount();
   window.addEventListener('beforeunload', event => {
-    if (!runnerActive) return;
+    if (!active) return;
     event.preventDefault();
-    event.returnValue = '赛事助手正在执行；关闭页面会使当前未完成局作废。';
+    event.returnValue = '网页正在执行当前局；关闭后该未完成局不会记分。';
   });
 })();
