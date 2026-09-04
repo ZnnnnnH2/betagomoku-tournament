@@ -17,6 +17,9 @@
   'use strict';
 
   const KEY = 'ruc-betagomoku-real-start-v2';
+  const LOCK_KEY = KEY + ':run-lock';
+  const INSTANCE_ID = 'tab-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  const LOCK_LEASE_MS = 3 * 60 * 1000;
   const $id = id => document.getElementById(id);
   const esc = value => String(value == null ? '' : value).replace(/[&<>'"]/g, c => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -26,8 +29,29 @@
   let fetchHooked = false;
   let drawHooked = false;
   let autoNextTimer = null;
+  let lockPulse = null;
 
   function save(state) { localStorage.setItem(KEY, JSON.stringify(state)); }
+  function readRunLock() {
+    try { return JSON.parse(localStorage.getItem(LOCK_KEY) || 'null'); }
+    catch (_) { return null; }
+  }
+  function claimRunLock() {
+    const now = Date.now();
+    const current = readRunLock();
+    if (current && current.owner !== INSTANCE_ID && current.until > now) return false;
+    localStorage.setItem(LOCK_KEY, JSON.stringify({ owner: INSTANCE_ID, until: now + LOCK_LEASE_MS }));
+    return readRunLock()?.owner === INSTANCE_ID;
+  }
+  function refreshRunLock() {
+    const current = readRunLock();
+    if (current?.owner === INSTANCE_ID) localStorage.setItem(LOCK_KEY, JSON.stringify({ owner: INSTANCE_ID, until: Date.now() + LOCK_LEASE_MS }));
+  }
+  function releaseRunLock() {
+    clearInterval(lockPulse);
+    lockPulse = null;
+    if (readRunLock()?.owner === INSTANCE_ID) localStorage.removeItem(LOCK_KEY);
+  }
   function load() {
     try {
       const state = JSON.parse(localStorage.getItem(KEY) || 'null');
@@ -367,8 +391,15 @@
   }
   async function runOne(state) {
     if (active) return;
+    if (!claimRunLock()) {
+      render(state);
+      tell('另一页面或另一份赛事脚本正在执行本届比赛；为避免重复对局，本页面未启动。请关闭重复标签页/旧脚本，或等待 3 分钟锁自动失效。', true);
+      return;
+    }
+    lockPulse = setInterval(refreshRunLock, 30000);
     const fixture = nextFixture(state);
     if (!fixture) {
+      releaseRunLock();
       render(state);
       tell(!state.knockout ? '小组赛已完成；请核对晋级名单后点击“进入淘汰赛”。' : '赛事已结束，冠军：' + state.knockout.champion);
       return;
@@ -413,6 +444,7 @@
       tell('本局未记分：' + (error.message || error), true);
     } finally {
       active = false;
+      releaseRunLock();
       render(state);
       if (autoNext) scheduleAutoNext(state);
     }
