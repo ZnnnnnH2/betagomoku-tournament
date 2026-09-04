@@ -230,27 +230,34 @@
     if (window.$) window.$('#fastmode').checkbox('set checked');
     else $id('fastmode')?.querySelector('input')?.click();
   }
-  function outcome(message) {
+  function outcome(messages) {
+    // 网页在非法落子时可能同时追加红色 FATAL 消息和绿色 Game Over 消息。
+    // 红色消息才是终局原因，必须优先记录，不能被绿色“某方获胜”概述覆盖。
+    const message = messages.find(node => node.classList.contains('negative')) || messages.find(node => node.classList.contains('success'));
+    if (!message) throw new Error('网页没有可解析的终局消息。');
     const text = message.innerText.replace(/\s+/g, ' ').trim();
+    const pageMessages = messages.map(node => node.innerText.replace(/\s+/g, ' ').trim());
     if (message.classList.contains('success')) {
-      if (/Draw\./i.test(text)) return { winner: 'draw', reason: '网页 Game Over：Draw.', pageMessage: text };
+      if (/Draw\./i.test(text)) return { winner: 'draw', reason: '网页 Game Over：Draw.', pageMessage: text, pageMessages };
       const match = text.match(/Player #([01]) \(([^)]+)\) won\./i);
       if (!match) throw new Error('无法解析网页终局消息：' + text);
-      return { winner: match[1] === '0' ? 'black' : 'white', reason: '网页 Game Over：' + match[0], pageMessage: text };
+      return { winner: match[1] === '0' ? 'black' : 'white', reason: '网页 Game Over：' + match[0], pageMessage: text, pageMessages };
     }
     const fault = text.match(/Player #([01]) FATAL ERROR:?\s*(.*)/i);
     if (!fault) throw new Error('无法解析网页错误消息：' + text);
-    return { winner: fault[1] === '0' ? 'white' : 'black', reason: '网页 ' + text, pageMessage: text };
+    return { winner: fault[1] === '0' ? 'white' : 'black', reason: '网页 ' + text, pageMessage: text, pageMessages };
   }
   function waitForEnd(previousMessages) {
     return new Promise((resolve, reject) => {
       const deadline = Date.now() + 16 * 60 * 1000;
+      let firstTerminalAt = null;
       const timer = setInterval(() => {
-        const message = [...document.querySelectorAll('.ui.message')].find(node =>
+        const messages = [...document.querySelectorAll('.ui.message')].filter(node =>
           !previousMessages.has(node) && (node.classList.contains('success') || node.classList.contains('negative')));
-        if (message && !$id('start_button').classList.contains('disabled')) {
+        if (messages.length && firstTerminalAt == null) firstTerminalAt = Date.now();
+        if (messages.length && Date.now() - firstTerminalAt >= 300 && !$id('start_button').classList.contains('disabled')) {
           clearInterval(timer);
-          try { resolve(outcome(message)); } catch (error) { reject(error); }
+          try { resolve(outcome(messages)); } catch (error) { reject(error); }
         } else if (Date.now() > deadline) {
           clearInterval(timer);
           reject(new Error('网页 16 分钟内没有返回终局结果；本局未记分。'));
@@ -272,7 +279,7 @@
       const result = await waitForEnd(previousMessages);
       return {
         black, white, winner: result.winner, moves: capture.history.length, history: capture.history,
-        executions: capture.executions, reason: result.reason, pageMessage: result.pageMessage, finishedAt: new Date().toISOString()
+        executions: capture.executions, reason: result.reason, pageMessage: result.pageMessage, pageMessages: result.pageMessages, finishedAt: new Date().toISOString()
       };
     } finally {
       capture = null;
